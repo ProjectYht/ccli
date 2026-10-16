@@ -12,7 +12,7 @@ out="$repo/docs/images"
 work="$(mktemp -d)"
 live=""
 sock="ccli-shots-$$"
-trap '[ -n "$live" ] && kill "$live" 2>/dev/null; tmux -L "$sock" kill-server 2>/dev/null; rm -rf "$work"' EXIT
+trap '[ -n "$live" ] && { kill "$live"; wait "$live"; } 2>/dev/null; tmux -L "$sock" kill-server 2>/dev/null; rm -rf "$work"' EXIT
 
 home="$work/home"
 mkdir -p "$out"
@@ -70,6 +70,12 @@ shot show show "${lead:0:8}"
 COLS=120 shot log log "${lead:0:8}"
 COLS=100 shot turn log "${lead:0:8}" 1
 COLS=124 shot prompts prompts --sort cost -n 14
+# For docs/tutorial.md: a turn with tool details, a subagent, a workflow run.
+COLS=100 shot tools log "${lead:0:8}" 3 --tools
+agent=$(ccli show "${lead:0:8}" --json | jq -r '[.. | objects | select(.description? == "Find every caller of the retry helper") | .agent_id][0]')
+run=$(ccli show "${lead:0:8}" --json | jq -r '.workflow_runs[0].id')
+COLS=100 shot agent log "${lead:0:8}" --agent "${agent:0:8}"
+COLS=100 shot run log "${lead:0:8}" --run "${run:0:8}"
 shot accounts accounts
 shot quota quota
 shot diff diff default work --project web-dashboard --all
