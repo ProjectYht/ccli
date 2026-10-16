@@ -60,7 +60,15 @@ func (t Term) Diff(a, b string, rows []DiffRow, total int) {
 		{title: "STATE"}, {title: "SIZE " + a + "/" + b, right: true}}, cells)
 	t.println(t.dim(fmt.Sprintf("%d only in %s · %d only in %s · %d %s ahead · %d %s ahead · %d diverged",
 		counts[transfer.OnlyA], a, counts[transfer.OnlyB], b, counts[transfer.AAhead], a, counts[transfer.BAhead], b, counts[transfer.Diverged])))
-	t.println(t.dim(fmt.Sprintf("To bring %s's sessions into %s: ccli copy --from %s --to %s  (prints the plan; add --apply)", a, b, a, b)))
+	// Suggest each direction that has sessions to bring over.
+	for _, d := range []struct {
+		from, to string
+		n        int
+	}{{a, b, counts[transfer.OnlyA] + counts[transfer.AAhead]}, {b, a, counts[transfer.OnlyB] + counts[transfer.BAhead]}} {
+		if d.n > 0 {
+			t.println(t.dim(fmt.Sprintf("To bring %s's sessions into %s: ccli copy --from %s --to %s  (prints the plan; add --apply)", d.from, d.to, d.from, d.to)))
+		}
+	}
 }
 
 func sizes(a, b int64) string {

@@ -146,6 +146,7 @@ func cmdPrompts(ctx context.Context, a *app, args []string) error {
 	fs := newFlags("prompts", a, &c)
 	days, since := sessionFlags(fs, &f, &accts)
 	fs.StringVar(&f.Sort, "sort", "last", "sort by last, cost, tokens, tools, duration or length")
+	fs.Lookup("q").Usage = "prompt text contains"
 	fs.IntVar(&f.Limit, "n", 40, "show at most N prompts (0 = all)")
 	noPager := fs.Bool("no-pager", false, "do not page long output")
 	if _, err := parse(fs, args); err != nil {

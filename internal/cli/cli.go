@@ -77,7 +77,9 @@ Usage:
   ccli diff <a> <b>                  sessions only in a, only in b, identical, ahead or diverged
   ccli copy|move <id>... --to <acct> copy a session (move also archives and removes the source)
   ccli copy|move --from a --to b     batch, dry run unless --apply
+  ccli fork <id> --to <acct>         continue a session under a new id, in any account
   ccli resume <id>                   run claude --resume in the session's account and folder
+  ccli resume <id> -a <acct> --sync  resume in another account, bringing its copy up to date first
   ccli statusline -- <cmd> [args]    status line wrapper that records rate limits
   ccli index [--rebuild]             update the index (other commands do this first)
   ccli version

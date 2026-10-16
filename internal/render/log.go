@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mattn/go-runewidth"
+
 	"github.com/lr00rl/ccli/internal/conv"
 	"github.com/lr00rl/ccli/internal/query"
 )
@@ -120,7 +122,7 @@ func (t Term) Turn(d *query.TurnDetail, opt LogOptions) {
 		title += " (" + tag + ")"
 	}
 	t.println(t.bold(title) + t.dim("  "+d.Session.ID[:min(8, len(d.Session.ID))]+" · "+d.Session.Account+" · "+fit(d.Session.Title, max(20, t.Width-40))))
-	t.println(t.dim(wrapPlain(turnFacts(t, r), max(30, t.Width))))
+	t.println(t.dim(joinWrap(turnFacts(t, r), " · ", max(30, t.Width))))
 	t.println()
 	if d.Turn != nil {
 		t.Conversation(d.Turn, opt, d.Agents)
@@ -147,7 +149,7 @@ func (t Term) Turn(d *query.TurnDetail, opt LogOptions) {
 	}
 }
 
-func turnFacts(t Term, r query.TurnRow) string {
+func turnFacts(t Term, r query.TurnRow) []string {
 	parts := []string{r.At.In(t.Loc).Format("2006-01-02 15:04")}
 	if r.DurationMS > 0 {
 		parts = append(parts, "took "+Dur(r.DurationMS))
@@ -168,7 +170,29 @@ func turnFacts(t Term, r query.TurnRow) string {
 	if r.Chars > 0 {
 		parts = append(parts, fmt.Sprintf("prompt %s chars", Num(int64(r.Chars))))
 	}
-	return strings.Join(parts, " · ")
+	return parts
+}
+
+// joinWrap joins parts with sep, starting a new line before a part that would
+// pass w cells, so no part is split across lines.
+func joinWrap(parts []string, sep string, w int) string {
+	var b strings.Builder
+	line := 0
+	for i, p := range parts {
+		pw := runewidth.StringWidth(p)
+		if i > 0 {
+			if line+runewidth.StringWidth(sep)+pw > w {
+				b.WriteString("\n")
+				line = 0
+			} else {
+				b.WriteString(sep)
+				line += runewidth.StringWidth(sep)
+			}
+		}
+		b.WriteString(p)
+		line += pw
+	}
+	return b.String()
 }
 
 // Conversation prints a turn's entries. agents label Agent calls with the
@@ -317,7 +341,7 @@ func (t Term) call(c *conv.Call, opt LogOptions, byTool map[string]query.AgentNo
 		t.println(t.dim("    prompt"))
 		t.println(t.Markdown(c.Prompt, "    ", w-4))
 	} else if in := toolInput(c); in != "" {
-		t.println(t.dim(indentLines(in, "    ")))
+		t.println(t.dim(indentLines(wrapPlain(strings.ReplaceAll(in, "\t", "    "), w-4), "    ")))
 	}
 	if c.Done && strings.TrimSpace(c.Output) != "" {
 		out := firstLines(strings.TrimRight(c.Output, "\n"), 14)
@@ -326,7 +350,7 @@ func (t Term) call(c *conv.Call, opt LogOptions, byTool map[string]query.AgentNo
 		} else if c.OutputLen > len(c.Output) {
 			out += fmt.Sprintf("\n… %s more", humanSize(int64(c.OutputLen-len(c.Output))))
 		}
-		t.println(t.dim(indentLines(wrapPlain(out, w-6), "    │ ")))
+		t.println(t.dim(indentLines(wrapPlain(strings.ReplaceAll(out, "\t", "    "), w-6), "    │ ")))
 	}
 }
 
@@ -342,7 +366,7 @@ func toolInput(c *conv.Call) string {
 	case "Bash":
 		return "$ " + firstLines(str("command"), 20)
 	case "Edit":
-		return "- " + firstLines(str("old_string"), 6) + "\n+ " + firstLines(str("new_string"), 6)
+		return markLines(firstLines(str("old_string"), 6), "- ") + "\n" + markLines(firstLines(str("new_string"), 6), "+ ")
 	case "Write":
 		return firstLines(str("content"), 10)
 	case "Workflow":
@@ -502,6 +526,11 @@ func indentLines(s, indent string) string {
 		lines[i] = indent + ln
 	}
 	return strings.Join(lines, "\n")
+}
+
+// markLines puts mark in front of every line of s, as a diff does.
+func markLines(s, mark string) string {
+	return mark + strings.ReplaceAll(s, "\n", "\n"+mark)
 }
 
 func firstLines(s string, n int) string {
