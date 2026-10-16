@@ -1,0 +1,336 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/lr00rl/ccli/internal/query"
+	"github.com/lr00rl/ccli/internal/render"
+)
+
+func init() {
+	commands["accounts"] = cmdAccounts
+	commands["sessions"] = cmdSessions
+	commands["ls"] = cmdSessions
+	commands["show"] = cmdShow
+	commands["stats"] = cmdStats
+	commands["resume"] = cmdResume
+}
+
+// common holds the flags every view takes.
+type common struct {
+	json    bool
+	noIndex bool
+	color   string
+}
+
+func (c *common) register(fs *flag.FlagSet) {
+	fs.BoolVar(&c.json, "json", false, "print JSON")
+	fs.BoolVar(&c.noIndex, "no-index", false, "skip updating the index first")
+	fs.StringVar(&c.color, "color", "auto", "color: auto, always or never")
+}
+
+// accountsFlag collects repeated -a values (comma separated allowed).
+type accountsFlag []string
+
+func (a *accountsFlag) String() string { return strings.Join(*a, ",") }
+func (a *accountsFlag) Set(v string) error {
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			*a = append(*a, s)
+		}
+	}
+	return nil
+}
+
+func newFlags(name string, a *app, c *common) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(a.errw)
+	c.register(fs)
+	return fs
+}
+
+// prepare opens everything, refreshes the index and builds the service.
+func (a *app) prepare(ctx context.Context, c common, accts []string) (*query.DB, error) {
+	if err := a.open(); err != nil {
+		return nil, err
+	}
+	for _, n := range accts {
+		found := false
+		for _, x := range a.accts {
+			if x.Name == n {
+				found = true
+			}
+		}
+		if !found {
+			a.close()
+			return nil, fmt.Errorf("no account named %q", n)
+		}
+	}
+	if !c.noIndex {
+		if _, err := a.refresh(ctx, false); err != nil {
+			a.close()
+			return nil, err
+		}
+	}
+	return query.New(a.st, a.accts), nil
+}
+
+func (a *app) term(c common) render.Term { return render.NewTerm(a.out, c.color) }
+
+func (a *app) printJSON(v any) error {
+	enc := json.NewEncoder(a.out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+func cmdAccounts(ctx context.Context, a *app, args []string) error {
+	var c common
+	fs := newFlags("accounts", a, &c)
+	days := fs.Int("days", 30, "usage window in days (0 = all time)")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	svc, err := a.prepare(ctx, c, nil)
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	f := query.Filter{Loc: time.Local}
+	f.Since, f.Until = query.RangeDays(*days, time.Local)
+	rows, err := svc.Accounts(ctx, f)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return a.printJSON(rows)
+	}
+	a.term(c).Accounts(rows, *days)
+	return nil
+}
+
+func sessionFlags(fs *flag.FlagSet, f *query.Filter, accts *accountsFlag) (*int, *string) {
+	fs.Var(accts, "a", "account (repeat or comma separate; default all)")
+	days := fs.Int("days", 30, "sessions active in the last N days (0 = all time)")
+	since := fs.String("since", "", "sessions active since a date (YYYY-MM-DD); overrides -days")
+	fs.StringVar(&f.Project, "project", "", "project path contains")
+	fs.StringVar(&f.Model, "model", "", "model contains")
+	fs.StringVar(&f.Search, "q", "", "title, path or id prefix contains")
+	return days, since
+}
+
+func applyRange(f *query.Filter, days int, since string) error {
+	f.Loc = time.Local
+	if since != "" {
+		t, err := time.ParseInLocation("2006-01-02", since, time.Local)
+		if err != nil {
+			return fmt.Errorf("-since: %w", err)
+		}
+		f.Since = t
+		return nil
+	}
+	f.Since, f.Until = query.RangeDays(days, time.Local)
+	return nil
+}
+
+func cmdSessions(ctx context.Context, a *app, args []string) error {
+	var c common
+	var f query.Filter
+	var accts accountsFlag
+	fs := newFlags("sessions", a, &c)
+	days, since := sessionFlags(fs, &f, &accts)
+	fs.StringVar(&f.Sort, "sort", "last", "sort by last, start, cost, tokens or active")
+	fs.IntVar(&f.Limit, "n", 40, "show at most N sessions (0 = all)")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	if err := applyRange(&f, *days, *since); err != nil {
+		return err
+	}
+	f.Accounts = accts
+	svc, err := a.prepare(ctx, c, accts)
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	page, err := svc.Sessions(ctx, f)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return a.printJSON(page)
+	}
+	a.term(c).Sessions(page, len(accts) != 1 && len(a.accts) > 1)
+	return nil
+}
+
+func cmdShow(ctx context.Context, a *app, args []string) error {
+	var c common
+	fs := newFlags("show", a, &c)
+	all := fs.Bool("all", false, "list every subagent")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("usage: ccli show <session id or prefix, optionally account:prefix>")
+	}
+	svc, err := a.prepare(ctx, c, nil)
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	d, err := svc.Session(ctx, pos[0])
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return a.printJSON(d)
+	}
+	a.term(c).Session(d, *all)
+	return nil
+}
+
+func cmdStats(ctx context.Context, a *app, args []string) error {
+	var c common
+	var f query.Filter
+	var accts accountsFlag
+	fs := newFlags("stats", a, &c)
+	days, since := sessionFlags(fs, &f, &accts)
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	if err := applyRange(&f, *days, *since); err != nil {
+		return err
+	}
+	f.Accounts = accts
+	svc, err := a.prepare(ctx, c, accts)
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	o, err := svc.Overview(ctx, f)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return a.printJSON(o)
+	}
+	shown := *days
+	if *since != "" {
+		shown = -1
+	}
+	a.term(c).Overview(o, shown)
+	return nil
+}
+
+// cmdResume runs `claude --resume` for the session, in its folder and with
+// its account's CLAUDE_CONFIG_DIR. It only starts Claude Code; ccli itself
+// changes nothing.
+func cmdResume(ctx context.Context, a *app, args []string) error {
+	var c common
+	fs := newFlags("resume", a, &c)
+	printOnly := fs.Bool("print", false, "print the command instead of running it")
+	fork := fs.Bool("fork", false, "resume into a new session id (--fork-session)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("usage: ccli resume [-print] [-fork] <session id or prefix>")
+	}
+	svc, err := a.prepare(ctx, c, nil)
+	if err != nil {
+		return err
+	}
+	d, err := svc.Session(ctx, pos[0])
+	a.close()
+	if err != nil {
+		return err
+	}
+	r := d.Resume
+	cmdline := r.Command
+	if *fork {
+		cmdline += " --fork-session"
+	}
+	if *printOnly || c.json {
+		if c.json {
+			return a.printJSON(r)
+		}
+		fmt.Fprintln(a.out, cmdline)
+		return nil
+	}
+	if !r.Available && !*fork {
+		return fmt.Errorf("cannot resume %s: %s (use -fork to branch it, or -print)", query.ShortID(d.ID), r.Reason)
+	}
+	if d.Missing {
+		return fmt.Errorf("cannot resume %s: %s", query.ShortID(d.ID), r.Reason)
+	}
+	var others []string
+	for _, l := range d.Links {
+		if l.Kind == "copy" {
+			others = append(others, l.Account)
+		}
+	}
+	if len(others) > 0 {
+		fmt.Fprintf(a.errw, "ccli: %s is also in %s; resuming the copy in %s (latest activity); use <account>:<id> for another\n",
+			query.ShortID(d.ID), strings.Join(others, ", "), d.Account)
+	}
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		return errors.New("claude is not on PATH")
+	}
+	argv := []string{"claude", "--resume", d.ID}
+	if *fork {
+		argv = append(argv, "--fork-session")
+	}
+	env := os.Environ()
+	env = withoutVar(env, "CLAUDE_CONFIG_DIR")
+	if d.Account != "default" {
+		env = append(env, "CLAUDE_CONFIG_DIR="+r.ConfigDir)
+	}
+	if r.Cwd != "" {
+		if err := os.Chdir(r.Cwd); err != nil {
+			return fmt.Errorf("cd %s: %w", r.Cwd, err)
+		}
+	}
+	return syscall.Exec(bin, argv, env)
+}
+
+func withoutVar(env []string, name string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, name+"=") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// parse accepts flags before and after positional arguments ("show ID
+// --json"), stopping at "--".
+func parse(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return pos, nil
+		}
+		if len(args) > len(rest) && args[len(args)-len(rest)-1] == "--" {
+			return append(pos, rest...), nil
+		}
+		pos = append(pos, rest[0])
+		args = rest[1:]
+	}
+}
