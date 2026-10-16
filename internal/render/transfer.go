@@ -150,3 +150,29 @@ func (t Term) Results(verb string, rs []transfer.Result, info map[string]query.S
 	past := map[string]string{"copy": "copied", "move": "moved"}[verb]
 	t.println(t.dim(fmt.Sprintf("%d of %d sessions %s.", done, len(rs), past)))
 }
+
+// ForkPlan prints what fork would do.
+func (t Term) ForkPlan(p transfer.ForkPlan, s query.SessionRow) {
+	title := s.Title
+	if title == "" {
+		title = "(untitled)"
+	}
+	t.println(t.bold(title))
+	if p.Reason != "" {
+		t.println(t.warn("cannot fork " + query.ShortID(p.SessionID) + ": " + p.Reason))
+		return
+	}
+	t.printf("fork %s from %s into %s as a new session %s\n", query.ShortID(p.SessionID), p.From, p.To, query.ShortID(p.NewSessionID))
+	t.println(t.dim(fmt.Sprintf("  writes a %s transcript and %s; the original is not touched", humanSize(p.Bytes), plural(p.Folders, "session folder"))))
+	t.println(t.dim("  usage already in the transcript stays with " + p.From + "; only new work counts toward " + p.To))
+	t.println(t.dim("Dry run. Add --apply to do it (a new id is drawn each time)."))
+}
+
+// Forked prints what fork did and how to go on.
+func (t Term) Forked(p transfer.ForkPlan, r transfer.Result) {
+	t.printf("%s forked %s → %s as %s, %d files written\n", t.money("✓"), p.From, p.To, p.NewSessionID, len(r.Written))
+	for _, c := range r.Conflicts {
+		t.printf("    %s %s\n", t.warn("left alone"), shortHome(c))
+	}
+	t.println(t.dim("continue it with: ccli resume " + query.ShortID(p.NewSessionID)))
+}

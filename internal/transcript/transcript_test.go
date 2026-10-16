@@ -115,6 +115,9 @@ func TestPromptKinds(t *testing.T) {
 	if res.FirstPrompt != "second prompt" {
 		t.Fatalf("first prompt = %q", res.FirstPrompt)
 	}
+	if res.Commands["/clear"] != 1 || len(res.Commands) != 1 {
+		t.Fatalf("commands = %v", res.Commands)
+	}
 	if res.Cwd != "/work/proj" {
 		t.Fatalf("cwd = %q", res.Cwd)
 	}
@@ -243,5 +246,152 @@ func TestCostStateProcesses(t *testing.T) {
 	}
 	if m := p.Models[1]; m.Model != "claude-opus-5-5" || m.Output != 20 || m.CostUSD != 2.5 || m.CacheWrite != 4 {
 		t.Fatalf("model usage = %+v", m)
+	}
+}
+
+func TestTurnsKindsAndOffsets(t *testing.T) {
+	agentCall := fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"id":"m2","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":1},"content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"look"}},{"type":"tool_use","id":"tu_w","name":"Workflow","input":{}},{"type":"tool_use","id":"tu_b","name":"Bash","input":{}}]}}`, ts(2))
+	agentResult := fmt.Sprintf(`{"type":"user","timestamp":%q,"toolUseResult":{"status":"async_launched","agentId":"a77"},"message":{"content":[{"type":"tool_result","tool_use_id":"tu_a","content":"launched"}]}}`, ts(2.1))
+	runResult := fmt.Sprintf(`{"type":"user","timestamp":%q,"toolUseResult":{"status":"async_launched","runId":"wf_1234abcd-001"},"message":{"content":[{"type":"tool_result","tool_use_id":"tu_w","content":"launched"}]}}`, ts(2.2))
+	lines := []string{
+		asst(0, "m0", "claude-opus-5-5", 1, 1, 0, 0, ""), // before the first prompt: turn 0
+		userText(1, "first **real** prompt", `,"origin":{"kind":"human"},"promptSource":"typed"`),
+		agentCall,
+		agentResult,
+		runResult,
+		`{"type":"system","subtype":"turn_duration","durationMs":4200,"timestamp":"` + ts(3) + `"}`,
+		userText(4, "Another Claude session sent a message:\n<teammate-message>hi</teammate-message>", ""),
+		userText(5, "<local-command-stdout>ok</local-command-stdout>", ""),
+		userText(6, "This session is being continued from a previous conversation", `,"isCompactSummary":true`),
+		userText(7, "<task-notification>done</task-notification>", `,"origin":{"kind":"task-notification"},"promptSource":"system"`),
+		userText(8, "pick this one", `,"origin":{"kind":"human"},"promptSource":"suggestion_accepted"`),
+		asst(9, "m3", "claude-opus-5-5", 1, 1, 0, 0, ""),
+	}
+	input := strings.Join(lines, "\n") + "\n"
+	res, err := Parse(strings.NewReader(input), Main, State{Base: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	for _, tr := range res.Turns {
+		kinds = append(kinds, fmt.Sprintf("%d:%s", tr.Seq, tr.Kind))
+	}
+	if got := strings.Join(kinds, " "); got != "1:human 2:peer 3:task 4:human" {
+		t.Fatalf("turns = %s", got)
+	}
+	if res.TypedPrompts != 2 || res.OtherPrompts != 2 {
+		t.Fatalf("typed=%d other=%d", res.TypedPrompts, res.OtherPrompts)
+	}
+	// Offsets are file offsets: Base plus the bytes before the line.
+	if want := int64(1000 + len(lines[0]) + 1); res.Turns[0].Offset != want {
+		t.Fatalf("offset = %d, want %d", res.Turns[0].Offset, want)
+	}
+	if !strings.HasPrefix(input[res.Turns[3].Offset-1000:], `{"type":"user"`) {
+		t.Fatalf("offset of turn 4 does not start its line")
+	}
+	if res.Turns[0].Text != "first **real** prompt" || res.Turns[0].Chars != 21 {
+		t.Fatalf("turn 1 = %+v", res.Turns[0])
+	}
+	if r := res.Responses; r[0].Turn != 0 || r[1].Turn != 1 || r[2].Turn != 4 {
+		t.Fatalf("response turns = %d %d %d", r[0].Turn, r[1].Turn, r[2].Turn)
+	}
+	s := res.TurnStats[1]
+	if s == nil || s.ToolCalls != 3 || s.Agents != 2 || s.DurationMS != 4200 || s.LastTS != parseTS(ts(2.2)) {
+		t.Fatalf("turn 1 stats = %+v", s)
+	}
+	if len(res.Spawns) != 2 || res.Spawns[0] != (Spawn{ToolUseID: "tu_a", Tool: "Agent", Turn: 1}) || res.Spawns[1].Tool != "Workflow" {
+		t.Fatalf("spawns = %+v", res.Spawns)
+	}
+	if res.Targets["tu_a"] != "a77" || res.Targets["tu_w"] != "wf_1234abcd-001" {
+		t.Fatalf("targets = %v", res.Targets)
+	}
+	if res.State.Turn != 4 || res.State.Base != 0 {
+		t.Fatalf("state = %+v", res.State)
+	}
+}
+
+func TestTurnNumberingContinuesAcrossParses(t *testing.T) {
+	a := userText(0, "one", "") + "\n" + asst(1, "m1", "claude-opus-5-5", 1, 1, 0, 0, "") + "\n"
+	b := userText(2, "two", "") + "\n" + asst(3, "m2", "claude-opus-5-5", 1, 1, 0, 0, "") + "\n"
+	first, _ := Parse(strings.NewReader(a), Main, State{})
+	st := first.State
+	st.Base = int64(len(a))
+	second, _ := Parse(strings.NewReader(b), Main, st)
+	if len(second.Turns) != 1 || second.Turns[0].Seq != 2 || second.Turns[0].Offset != int64(len(a)) {
+		t.Fatalf("second parse turns = %+v", second.Turns)
+	}
+	if second.Responses[0].Turn != 2 {
+		t.Fatalf("response turn = %d", second.Responses[0].Turn)
+	}
+}
+
+func TestImportedRanges(t *testing.T) {
+	l1 := asst(0, "m1", "claude-opus-5-5", 1, 1, 0, 0, "") + "\n"
+	l2 := `{"type":"cost-state","startTime":5,"totalCostUSD":1,"modelUsage":{"claude-opus-5-5":{"inputTokens":1,"outputTokens":1,"costUSD":1}}}` + "\n"
+	l3 := asst(1, "m2", "claude-opus-5-5", 1, 1, 0, 0, "") + "\n"
+	base := int64(500)
+	st := State{Base: base, Imported: []Range{{From: 0, To: base + int64(len(l1)+len(l2))}}}
+	res, _ := Parse(strings.NewReader(l1+l2+l3), Main, st)
+	if !res.Responses[0].Imported || res.Responses[1].Imported {
+		t.Fatalf("imported = %v %v", res.Responses[0].Imported, res.Responses[1].Imported)
+	}
+	if len(res.Processes) != 1 || !res.Processes[0].Imported {
+		t.Fatalf("processes = %+v", res.Processes)
+	}
+	if res.State.Imported != nil {
+		t.Fatalf("imported ranges carried over")
+	}
+}
+
+func TestSubagentFirstPromptAndAttribution(t *testing.T) {
+	res := parse(t, Subagent,
+		userText(0, "Review   the diff\nin full", `,"isSidechain":true,"agentId":"a1"`),
+		`{"type":"assistant","isSidechain":true,"attributionAgent":"code-reviewer","timestamp":"`+ts(1)+`","message":{"id":"s1","model":"m","usage":{"input_tokens":1}}}`,
+	)
+	if res.FirstPrompt != "Review the diff in full" || res.Attribution != "code-reviewer" || len(res.Turns) != 0 {
+		t.Fatalf("subagent: prompt=%q attribution=%q turns=%d", res.FirstPrompt, res.Attribution, len(res.Turns))
+	}
+}
+
+func TestTeammateSpawnTarget(t *testing.T) {
+	call := fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"id":"m1","model":"m","content":[{"type":"tool_use","id":"tu_t","name":"Agent","input":{}}]}}`, ts(1))
+	result := fmt.Sprintf(`{"type":"user","timestamp":%q,"toolUseResult":{"status":"teammate_spawned","teammate_id":"researcher@session-1234abcd","agent_id":"researcher@session-1234abcd","name":"researcher"},"message":{"content":[{"type":"tool_result","tool_use_id":"tu_t","content":"ok"}]}}`, ts(2))
+	res := parse(t, Main, userText(0, "go", ""), call, result)
+	if res.Targets["tu_t"] != "teammate:researcher" {
+		t.Fatalf("targets = %v", res.Targets)
+	}
+}
+
+func TestReplayedStretchCountsOnce(t *testing.T) {
+	call := func(at float64, msg, tool string) string {
+		return fmt.Sprintf(`{"type":"assistant","timestamp":%q,"message":{"id":%q,"model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":1},"content":[{"type":"tool_use","id":%q,"name":"Bash","input":{}}]}}`, ts(at), msg, tool)
+	}
+	lines := []string{
+		userText(0, "first", `,"promptId":"p1"`),
+		call(1, "m1", "tu1"),
+		userText(2, "second", `,"promptId":"p2"`),
+		call(3, "m2", "tu2"),
+		`{"type":"custom-title","customTitle":"t","timestamp":"` + ts(900) + `"}`,
+		// Resumed later: Claude Code writes the first turn again.
+		userText(0, "first", `,"promptId":"p1"`),
+		call(1, "m1", "tu1"),
+		userText(5, "third", `,"promptId":"p3"`),
+		userText(6, "[Request interrupted by user]", `,"promptId":"p4"`),
+	}
+	res := parse(t, Main, lines...)
+	if len(res.Turns) != 3 || res.Turns[2].Text != "third" || res.TypedPrompts != 3 {
+		t.Fatalf("turns = %+v typed=%d", res.Turns, res.TypedPrompts)
+	}
+	if s := res.TurnStats[2]; s.ToolCalls != 1 || s.LastTS != parseTS(ts(3)) {
+		t.Fatalf("turn 2 stats = %+v (the replay or the title line counted)", s)
+	}
+	if len(res.Responses) != 2 || res.Responses[0].Turn != 1 {
+		t.Fatalf("responses = %+v", res.Responses)
+	}
+	// The replay resumes across parses with the prompt ids the caller loads.
+	st := State{Turn: 2, Prompts: map[string]bool{"p1": true, "p2": true}}
+	again, _ := Parse(strings.NewReader(strings.Join(lines[5:7], "\n")+"\n"), Main, st)
+	if len(again.Turns) != 0 || !again.State.Replay || !again.Responses[0].Replay {
+		t.Fatalf("incremental replay: turns=%d state=%+v", len(again.Turns), again.State)
 	}
 }

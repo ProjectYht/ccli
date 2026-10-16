@@ -24,6 +24,7 @@ func init() {
 	commands["move"] = func(ctx context.Context, a *app, args []string) error {
 		return cmdTransfer(ctx, a, args, transfer.Move)
 	}
+	commands["fork"] = cmdFork
 }
 
 func (a *app) account(name string) (account.Account, error) { return account.Find(a.accts, name) }
@@ -262,7 +263,14 @@ func cmdTransfer(ctx context.Context, a *app, args []string, mode transfer.Mode)
 			results = append(results, transfer.Result{Op: op})
 			continue
 		}
-		res, err := transfer.Apply(op, opt)
+		l := a.ledger(ctx, name, op.SessionID, "", op.From, op.To)
+		o := opt
+		o.Intend = l.intend
+		res, err := transfer.Apply(op, o)
+		// Whatever was written is recorded, even when a later step failed.
+		if rerr := l.finish(res.Imports); rerr != nil && err == nil {
+			err = rerr
+		}
 		if err != nil {
 			failed++
 			res.Op = op
@@ -271,15 +279,255 @@ func cmdTransfer(ctx context.Context, a *app, args []string, mode transfer.Mode)
 		}
 		results = append(results, res)
 	}
-	if _, err := a.refresh(ctx, false); err != nil {
-		return err
-	}
+	// The files are written either way; report them before any index error.
+	_, rerr := a.refresh(ctx, false)
 	if c.json {
-		return a.printJSON(results)
+		if err := a.printJSON(results); err != nil {
+			return err
+		}
+	} else {
+		t.Results(name, results, info)
 	}
-	t.Results(name, results, info)
 	if failed > 0 {
 		return fmt.Errorf("%d of %d sessions failed", failed, len(ops))
 	}
-	return nil
+	return rerr
+}
+
+// ledger records what a copy, move or fork writes into an account, so the
+// index leaves that usage with the account it came from. Each transcript
+// range is recorded before its bytes are put in place (transfer.Intend):
+// neither a failed write nor an index run in between can leave copied bytes
+// counted as the target's own.
+type ledger struct {
+	ctx                       context.Context
+	a                         *app
+	mode, id, newID, from, to string
+	done                      map[string]int64 // path -> end of the range recorded for it
+}
+
+func (a *app) ledger(ctx context.Context, mode, id, newID, from, to string) *ledger {
+	return &ledger{ctx: ctx, a: a, mode: mode, id: id, newID: newID, from: from, to: to, done: map[string]int64{}}
+}
+
+func (l *ledger) entry(im transfer.Import) store.Transfer {
+	return store.Transfer{At: time.Now(), Mode: l.mode, SessionID: l.id, NewSessionID: l.newID,
+		FromAccount: l.from, ToAccount: l.to, Path: im.Path, From: im.From, To: im.To}
+}
+
+// intend is the transfer.Intend hook.
+func (l *ledger) intend(im transfer.Import) (func(), error) {
+	id, err := l.a.st.RecordTransfer(l.ctx, l.entry(im))
+	if err != nil {
+		return nil, err
+	}
+	l.done[im.Path] = im.To
+	return func() {
+		delete(l.done, im.Path)
+		if err := l.a.st.DeleteTransfer(l.ctx, id); err != nil {
+			fmt.Fprintf(l.a.errw, "ccli: the ledger still lists bytes %d to %d of %s, which were not written: %v\n", im.From, im.To, im.Path, err)
+		}
+	}, nil
+}
+
+// finish records written bytes the hook did not cover: a source that grew
+// while it was being copied.
+func (l *ledger) finish(imports []transfer.Import) error {
+	var rest []store.Transfer
+	for _, im := range imports {
+		if to, ok := l.done[im.Path]; ok && to > im.From {
+			im.From = to
+		}
+		if im.To > im.From {
+			rest = append(rest, l.entry(im))
+		}
+	}
+	return l.a.st.RecordTransfers(l.ctx, rest)
+}
+
+// cmdFork copies a session into an account under a new id, so the copy and
+// the original can each go on.
+func cmdFork(ctx context.Context, a *app, args []string) error {
+	var c common
+	fs := newFlags("fork", a, &c)
+	to := fs.String("to", "", "target account (required; may be the session's own account)")
+	from := fs.String("from", "", "source account (default: the copy with the latest activity)")
+	apply := fs.Bool("apply", false, "carry out the fork (without it nothing is written)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 || *to == "" {
+		return errors.New("usage: ccli fork <session> --to <account> [--from <account>] [--apply]")
+	}
+	svc, err := a.prepare(ctx, c, nil)
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	acct, id, err := svc.Resolve(ctx, pos[0])
+	if err != nil {
+		return err
+	}
+	if *from != "" {
+		acct = *from
+	}
+	src, err := a.account(acct)
+	if err != nil {
+		return err
+	}
+	dst, err := a.account(*to)
+	if err != nil {
+		return err
+	}
+	newID, err := transfer.NewID()
+	if err != nil {
+		return err
+	}
+	p, err := transfer.PlanFork(id, src, dst, newID)
+	if err != nil {
+		return err
+	}
+	info, err := sessionInfo(ctx, svc, src.Name)
+	if err != nil {
+		return err
+	}
+	t := a.term(c)
+	if !*apply {
+		if c.json {
+			return a.printJSON(p)
+		}
+		t.ForkPlan(p, info[src.Name+"/"+id])
+		return nil
+	}
+	l := a.ledger(ctx, "fork", id, newID, src.Name, dst.Name)
+	res, ferr := transfer.Fork(p, l.intend)
+	if err := l.finish(res.Imports); err != nil && ferr == nil {
+		ferr = err
+	}
+	_, rerr := a.refresh(ctx, false)
+	if c.json {
+		if err := a.printJSON(map[string]any{"plan": p, "result": res}); err != nil {
+			return err
+		}
+	} else if ferr == nil {
+		t.Forked(p, res)
+	}
+	if ferr != nil {
+		return ferr
+	}
+	return rerr
+}
+
+// syncFor makes sure account `in` holds the newest copy of a session before
+// it is resumed there. A copy that is behind (a prefix of a newer one) is
+// brought up to date when apply is set; diverged copies are never merged.
+func (a *app) syncFor(ctx context.Context, id, in string, apply bool) error {
+	target, err := a.account(in)
+	if err != nil {
+		return err
+	}
+	type cp struct {
+		acct account.Account
+		path string
+	}
+	var mine *cp
+	var others []cp
+	for _, ac := range a.accts {
+		f, err := transfer.Locate(ac, id)
+		if err != nil {
+			if transfer.IsNotFound(err) {
+				continue
+			}
+			// Skipping it could pick a stale copy, or write a second
+			// transcript next to one that could not be read.
+			return fmt.Errorf("%s: %w", ac.Name, err)
+		}
+		if f.Transcript == "" {
+			continue
+		}
+		if ac.Name == target.Name {
+			mine = &cp{ac, f.Transcript}
+		} else {
+			others = append(others, cp{ac, f.Transcript})
+		}
+	}
+	short := query.ShortID(id)
+	// Copies ahead of this account's own (it is a prefix of them) make it
+	// behind. A copy that diverged from it is a separate branch: it does
+	// not stop this account resuming its own.
+	var ahead []*cp
+	for i := range others {
+		o := &others[i]
+		if mine == nil {
+			ahead = append(ahead, o)
+			continue
+		}
+		st, err := transfer.Relation(o.path, mine.path)
+		if err != nil {
+			return err
+		}
+		switch st {
+		case transfer.AAhead:
+			ahead = append(ahead, o)
+		case transfer.Diverged:
+			fmt.Fprintf(a.errw, "ccli: the copy of %s in %s went on separately from %s's; resuming %s's (ccli fork %s --from %s --to %s continues that one as a new session)\n",
+				short, o.acct.Name, target.Name, target.Name, short, o.acct.Name, target.Name)
+		}
+	}
+	if len(ahead) == 0 {
+		if mine == nil {
+			return fmt.Errorf("%s has no transcript in any account", short)
+		}
+		return nil
+	}
+	// The newest is the copy every other newer copy is a prefix of.
+	newest := ahead[0]
+	for _, o := range ahead[1:] {
+		st, err := transfer.Relation(o.path, newest.path)
+		if err != nil {
+			return err
+		}
+		switch st {
+		case transfer.AAhead:
+			newest = o
+		case transfer.Diverged:
+			return fmt.Errorf("the copies of %s in %s and %s are both newer than %s's and have diverged; continue one with ccli fork %s --from <account> --to %s",
+				short, newest.acct.Name, o.acct.Name, target.Name, short, target.Name)
+		}
+	}
+	what := "has no copy of"
+	if mine != nil {
+		what = "has an older copy of"
+	}
+	if !apply {
+		return fmt.Errorf("%s %s %s than %s. Add --sync to bring it up to date first, or resume it in %s", target.Name, what, short, newest.acct.Name, newest.acct.Name)
+	}
+	opt := transfer.Options{Live: func(sid string) bool {
+		for _, l := range account.LiveSessions(a.accts) {
+			if l.SessionID == sid {
+				return true
+			}
+		}
+		return false
+	}}
+	op, err := transfer.Plan(id, newest.acct, target, transfer.Copy, opt)
+	if err != nil {
+		return err
+	}
+	if op.Action == transfer.Refuse {
+		return fmt.Errorf("cannot bring %s up to date in %s: %s", short, target.Name, op.Reason)
+	}
+	l := a.ledger(ctx, "copy", id, "", newest.acct.Name, target.Name)
+	opt.Intend = l.intend
+	res, err := transfer.Apply(op, opt)
+	if rerr := l.finish(res.Imports); rerr != nil && err == nil {
+		err = rerr
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.errw, "ccli: brought %s up to date in %s from %s (%s)\n", short, target.Name, newest.acct.Name, op.Action)
+	_, err = a.refresh(ctx, false)
+	return err
 }

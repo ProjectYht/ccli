@@ -1,0 +1,47 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"os"
+
+	"golang.org/x/term"
+
+	"github.com/lr00rl/ccli/internal/tui"
+)
+
+func init() {
+	commands["view"] = cmdView
+}
+
+// cmdView opens the interactive browser, at a session's turns when one is
+// named.
+func cmdView(ctx context.Context, a *app, args []string) error {
+	var c common
+	fs := newFlags("view", a, &c)
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 1 {
+		return errors.New("usage: ccli view [session]")
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+		return errors.New("ccli view needs a terminal; ccli log prints the same turns")
+	}
+	svc, err := a.prepare(ctx, c, nil)
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	ref := ""
+	if len(pos) == 1 {
+		acct, id, err := svc.Resolve(ctx, pos[0])
+		if err != nil {
+			return err
+		}
+		ref = acct + ":" + id
+	}
+	svc.CacheSessions()
+	return tui.Run(ctx, svc, ref)
+}

@@ -17,9 +17,13 @@ type SessionDetail struct {
 	Runs      []RunInfo  `json:"workflow_runs"`
 	Tools     []Count    `json:"tools"`
 	Skills    []Count    `json:"skills"`
+	Commands  []Count    `json:"commands"` // slash commands typed in the session
+	Moves     []Move     `json:"moves"`    // copies, moves and forks ccli made of it
 	Links     []Link     `json:"links"`
 	Processes int        `json:"processes_with_own_totals"`
 	Resume    Resume     `json:"resume"`
+
+	graph *graph // turns, with each subagent and run placed in one
 }
 
 // FileInfo is one transcript file of the session.
@@ -35,6 +39,11 @@ type FileInfo struct {
 	ToolUseID   string    `json:"tool_use_id,omitempty"`
 	Parent      string    `json:"parent,omitempty"` // agent id of the spawning subagent, "" for the main transcript
 	RunID       string    `json:"run_id,omitempty"`
+	Skill       string    `json:"skill,omitempty"`       // a skill run as a subagent
+	Phase       string    `json:"phase,omitempty"`       // workflow phase
+	Attribution string    `json:"attribution,omitempty"` // agent type from the transcript lines
+	Task        string    `json:"task,omitempty"`        // first line of the prompt a subagent was given
+	Turn        int       `json:"turn"`                  // turn of the main conversation that started it, 0 if unknown
 	Size        int64     `json:"size"`
 	Missing     bool      `json:"missing"`
 	Responses   int       `json:"responses"`
@@ -46,13 +55,25 @@ type FileInfo struct {
 
 // RunInfo summarizes a workflow run.
 type RunInfo struct {
-	ID       string `json:"id"`
-	Launched int    `json:"launched"`
-	Started  int    `json:"started"`
-	Results  int    `json:"results"`
-	Failed   int    `json:"failed"`
-	Agents   int    `json:"agents"`
+	ID         string    `json:"id"`
+	Name       string    `json:"name,omitempty"`
+	Status     string    `json:"status,omitempty"`
+	Summary    string    `json:"summary,omitempty"`
+	At         time.Time `json:"started_at,omitempty"`
+	DurationMS int64     `json:"duration_ms,omitempty"`
+	Launched   int       `json:"launched"`
+	Started    int       `json:"started"`
+	Results    int       `json:"results"`
+	Failed     int       `json:"failed"`
+	Agents     int       `json:"agents"` // transcripts on disk
+	Turn       int       `json:"turn"`
+	Tokens     Tokens    `json:"tokens"`
+	Cost       float64   `json:"cost"`
 }
+
+// Unfinished is how many agents started and neither returned nor failed:
+// stopped with the run, or still running.
+func (r RunInfo) Unfinished() int { return max(0, r.Started-r.Results-r.Failed) }
 
 // Count is a name with a number.
 type Count struct {
@@ -134,6 +155,25 @@ func (d *DB) Resolve(ctx context.Context, ref string) (account, id string, err e
 
 // Session returns the detail of one session.
 func (d *DB) Session(ctx context.Context, ref string) (*SessionDetail, error) {
+	if d.cache == nil {
+		return d.session(ctx, ref)
+	}
+	d.cacheMu.Lock()
+	det := d.cache[ref]
+	d.cacheMu.Unlock()
+	if det != nil {
+		return det, nil
+	}
+	det, err := d.session(ctx, ref)
+	if err == nil {
+		d.cacheMu.Lock()
+		d.cache[ref] = det
+		d.cacheMu.Unlock()
+	}
+	return det, err
+}
+
+func (d *DB) session(ctx context.Context, ref string) (*SessionDetail, error) {
 	acct, id, err := d.Resolve(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -160,14 +200,20 @@ func (d *DB) Session(ctx context.Context, ref string) (*SessionDetail, error) {
 	if err := d.fillLinks(ctx, det); err != nil {
 		return nil, err
 	}
+	if err := d.fillMoves(ctx, det); err != nil {
+		return nil, err
+	}
+	if det.graph, err = d.buildGraph(ctx, det); err != nil {
+		return nil, err
+	}
 	det.Resume = d.resume(det)
 	return det, nil
 }
 
 func (d *DB) fillFiles(ctx context.Context, det *SessionDetail) error {
 	rows, err := d.sql().QueryContext(ctx, `SELECT f.id, f.path, f.kind, f.agent_id, f.agent_type, f.description, f.request_shape, f.spawn_depth,
-		f.tool_use_id, f.run_id, f.size, f.missing, f.first_ts, f.last_ts,
-		COALESCE((SELECT sf.agent_id FROM spawns s JOIN files sf ON sf.id = s.file_id WHERE s.tool_use_id = f.tool_use_id AND f.tool_use_id <> ''
+		f.tool_use_id, f.run_id, f.size, f.missing, f.first_ts, f.last_ts, f.skill, f.phase, f.attribution, f.first_prompt,
+		COALESCE(NULLIF(f.parent_agent, ''), (SELECT sf.agent_id FROM spawns s JOIN files sf ON sf.id = s.file_id WHERE s.tool_use_id = f.tool_use_id AND f.tool_use_id <> ''
 			AND sf.account = f.account AND sf.session_id = f.session_id ORDER BY sf.id LIMIT 1), ''),
 		COUNT(r.key), COALESCE(SUM(r.input), 0), COALESCE(SUM(r.output), 0), COALESCE(SUM(r.cache_read), 0),
 		COALESCE(SUM(r.cache_5m + r.cache_1h), 0), COALESCE(SUM(r.cost), 0)
@@ -182,9 +228,12 @@ func (d *DB) fillFiles(ctx context.Context, det *SessionDetail) error {
 		var missing int
 		var first, last int64
 		if err := rows.Scan(&fi.ID, &fi.Path, &fi.Kind, &fi.AgentID, &fi.AgentType, &fi.Description, &fi.Shape, &fi.Depth,
-			&fi.ToolUseID, &fi.RunID, &fi.Size, &missing, &first, &last, &fi.Parent,
+			&fi.ToolUseID, &fi.RunID, &fi.Size, &missing, &first, &last, &fi.Skill, &fi.Phase, &fi.Attribution, &fi.Task, &fi.Parent,
 			&fi.Responses, &fi.Tokens.Input, &fi.Tokens.Output, &fi.Tokens.CacheRead, &fi.Tokens.CacheWrite, &fi.Cost); err != nil {
 			return err
+		}
+		if fi.Kind == "main" {
+			fi.Task = ""
 		}
 		fi.Missing = missing != 0
 		fi.Started, fi.Last = ms(first), ms(last)
@@ -193,26 +242,63 @@ func (d *DB) fillFiles(ctx context.Context, det *SessionDetail) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	rrows, err := d.sql().QueryContext(ctx, `SELECT run_id, launched, started, results, failed FROM runs WHERE account = ? AND session_id = ? ORDER BY run_id`, det.Account, det.ID)
+	rrows, err := d.sql().QueryContext(ctx, `SELECT run_id, launched, started, results, failed, name, status, summary, start_ms, duration_ms
+		FROM runs WHERE account = ? AND session_id = ? ORDER BY run_id`, det.Account, det.ID)
 	if err != nil {
 		return err
 	}
 	defer rrows.Close()
-	agents := map[string]int{}
+	type agg struct {
+		n     int
+		tok   Tokens
+		cost  float64
+		first time.Time
+	}
+	byRun := map[string]*agg{}
 	for _, f := range det.Files {
-		if f.RunID != "" {
-			agents[f.RunID]++
+		if f.RunID == "" {
+			continue
+		}
+		a := byRun[f.RunID]
+		if a == nil {
+			a = &agg{}
+			byRun[f.RunID] = a
+		}
+		a.n++
+		a.tok.add(f.Tokens)
+		a.cost += f.Cost
+		if !f.Started.IsZero() && (a.first.IsZero() || f.Started.Before(a.first)) {
+			a.first = f.Started
 		}
 	}
+	seen := map[string]bool{}
 	for rrows.Next() {
 		var r RunInfo
-		if err := rrows.Scan(&r.ID, &r.Launched, &r.Started, &r.Results, &r.Failed); err != nil {
+		var start int64
+		if err := rrows.Scan(&r.ID, &r.Launched, &r.Started, &r.Results, &r.Failed, &r.Name, &r.Status, &r.Summary, &start, &r.DurationMS); err != nil {
 			return err
 		}
-		r.Agents = agents[r.ID]
+		r.At = ms(start)
+		if a := byRun[r.ID]; a != nil {
+			r.Agents, r.Tokens, r.Cost = a.n, a.tok, a.cost
+			if r.At.IsZero() {
+				r.At = a.first
+			}
+		}
+		seen[r.ID] = true
 		det.Runs = append(det.Runs, r)
 	}
-	return rrows.Err()
+	if err := rrows.Err(); err != nil {
+		return err
+	}
+	// Runs whose journal and state file are gone still have transcripts.
+	for id, a := range byRun {
+		if !seen[id] {
+			det.Runs = append(det.Runs, RunInfo{ID: id, Agents: a.n, Tokens: a.tok, Cost: a.cost, At: a.first})
+		}
+	}
+	sort.Slice(det.Runs, func(i, j int) bool { return det.Runs[i].At.Before(det.Runs[j].At) })
+	return nil
 }
 
 func (d *DB) fillUsage(ctx context.Context, det *SessionDetail) error {
@@ -253,9 +339,12 @@ func (d *DB) fillUsage(ctx context.Context, det *SessionDetail) error {
 			trows.Close()
 			return err
 		}
-		if skill != "" {
+		switch {
+		case name == "Command":
+			det.Commands = append(det.Commands, Count{skill, n})
+		case skill != "":
 			det.Skills = append(det.Skills, Count{skill, n})
-		} else {
+		default:
 			det.Tools = append(det.Tools, Count{name, n})
 		}
 	}
@@ -359,4 +448,36 @@ func shellQuote(s string) string {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// Move is one copy, move or fork of a session that ccli carried out.
+type Move struct {
+	At           time.Time `json:"at"`
+	Mode         string    `json:"mode"`
+	From         string    `json:"from"`
+	To           string    `json:"to"`
+	NewSessionID string    `json:"new_session_id,omitempty"`
+	Bytes        int64     `json:"bytes"`
+	Files        int       `json:"files"`
+}
+
+func (d *DB) fillMoves(ctx context.Context, det *SessionDetail) error {
+	ts, err := d.st.Transfers(ctx, det.ID)
+	if err != nil {
+		return err
+	}
+	for _, t := range ts {
+		n := len(det.Moves)
+		if n > 0 {
+			m := &det.Moves[n-1]
+			if m.At.Equal(t.At) && m.Mode == t.Mode && m.From == t.FromAccount && m.To == t.ToAccount && m.NewSessionID == t.NewSessionID {
+				m.Bytes += t.To - t.From
+				m.Files++
+				continue
+			}
+		}
+		det.Moves = append(det.Moves, Move{At: t.At, Mode: t.Mode, From: t.FromAccount, To: t.ToAccount,
+			NewSessionID: t.NewSessionID, Bytes: t.To - t.From, Files: 1})
+	}
+	return nil
 }

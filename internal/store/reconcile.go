@@ -11,7 +11,7 @@ import (
 
 // ReconcileVersion changes when the reconciliation rules change; a database
 // reconciled under another version is redone in full.
-const ReconcileVersion = "3"
+const ReconcileVersion = "4"
 
 // SessionKey names a session within an account.
 type SessionKey struct {
@@ -28,7 +28,8 @@ type SessionKey struct {
 // A copied or forked transcript repeats its original's cost-state lines, so
 // one process can appear in several sessions. Its responses are counted in
 // whichever of those sessions the store placed them, and its shortfall is
-// added once, to the session of the earliest-created file holding it.
+// added once: to a file that holds the snapshot as its own (not copied in by
+// ccli), the earliest created of them.
 //
 // The marks are cleared in the same transaction, so a run that stops early
 // leaves them for the next one. normalize maps model names to price-table keys;
@@ -119,6 +120,7 @@ type snapshot struct {
 	fileID, end int64
 	sess        SessionKey
 	rank        int64 // creation order: birth time, else first line time
+	imported    bool  // ccli copied this snapshot in from another account
 	models      map[string]sums
 }
 
@@ -138,6 +140,12 @@ func reconcileOne(ctx context.Context, tx *sql.Tx, k SessionKey, normalize func(
 		}
 		owner, best := snaps[0], snaps[0]
 		for _, sn := range snaps[1:] {
+			if owner.imported != sn.imported {
+				if owner.imported {
+					owner = sn
+				}
+				continue
+			}
 			if sn.rank < owner.rank || sn.rank == owner.rank && sn.fileID < owner.fileID {
 				owner = sn
 			}
@@ -200,7 +208,7 @@ func reconcileOne(ctx context.Context, tx *sql.Tx, k SessionKey, normalize func(
 // holders returns every file's snapshot of the process that started at start.
 func holders(ctx context.Context, tx *sql.Tx, start int64, normalize func(string) string) ([]*snapshot, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT p.file_id, p.end_ms, p.model, p.input, p.output, p.cache_read, p.cache_write, p.web_search, p.cost,
-		f.account, f.session_id, f.born, f.first_ts
+		f.account, f.session_id, f.born, f.first_ts, p.imported
 		FROM processes p JOIN files f ON f.id = p.file_id WHERE p.start_ms = ? ORDER BY p.file_id`, start)
 	if err != nil {
 		return nil, err
@@ -210,11 +218,12 @@ func holders(ctx context.Context, tx *sql.Tx, start int64, normalize func(string
 	byFile := map[int64]*snapshot{}
 	for rows.Next() {
 		var fileID, end, born, first int64
+		var imported bool
 		var model string
 		var v sums
 		var sess SessionKey
 		if err := rows.Scan(&fileID, &end, &model, &v.input, &v.output, &v.read, &v.write, &v.web, &v.cost,
-			&sess.Account, &sess.SessionID, &born, &first); err != nil {
+			&sess.Account, &sess.SessionID, &born, &first, &imported); err != nil {
 			return nil, err
 		}
 		sn := byFile[fileID]
@@ -226,7 +235,7 @@ func holders(ctx context.Context, tx *sql.Tx, start int64, normalize func(string
 			if rank == 0 {
 				rank = math.MaxInt64
 			}
-			sn = &snapshot{fileID: fileID, end: end, sess: sess, rank: rank, models: map[string]sums{}}
+			sn = &snapshot{fileID: fileID, end: end, sess: sess, rank: rank, imported: imported, models: map[string]sums{}}
 			byFile[fileID] = sn
 			out = append(out, sn)
 		}

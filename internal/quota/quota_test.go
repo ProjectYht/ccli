@@ -325,3 +325,33 @@ func TestWrap(t *testing.T) {
 func statusPayload(transcript string) []byte {
 	return []byte(`{"session_id":"boundary","transcript_path":"` + transcript + `","model":{"id":"claude-opus-5-5"},"rate_limits":{"five_hour":{"used_percentage":9,"resets_at":50}}}`)
 }
+
+func TestCclineCacheAndLatest(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "ccline"), 0o700)
+	os.WriteFile(filepath.Join(dir, "ccline", ".api_usage_cache.json"),
+		[]byte(`{"five_hour_utilization":3.0,"seven_day_utilization":10.0,"resets_at":"2026-10-22T11:00:00.4+00:00","cached_at":"2026-10-16T03:25:11+00:00"}`), 0o600)
+	cc, ok := CclineCache(dir)
+	if !ok || cc.FiveHour.UsedPercent != 3 || cc.SevenDay.UsedPercent != 10 || cc.SevenDay.ResetsAt.Day() != 22 {
+		t.Fatalf("ccline = %+v %v", cc, ok)
+	}
+	reset5 := time.Date(2026, 10, 16, 6, 0, 0, 0, time.UTC)
+	status := &Snapshot{CapturedAt: time.Date(2026, 10, 16, 3, 0, 0, 0, time.UTC),
+		FiveHour: &Window{UsedPercent: 1, ResetsAt: reset5},
+		SevenDay: &Window{UsedPercent: 9, ResetsAt: time.Date(2026, 10, 22, 11, 0, 0, 0, time.UTC)}}
+	five, seven := Latest(status, &cc)
+	// ccline is newer: its numbers win, and the 5-hour reset comes from the
+	// status line since ccline does not keep it.
+	if five.Source != "ccline" || five.UsedPercent != 3 || !five.ResetsAt.Equal(reset5) {
+		t.Fatalf("five = %+v", five)
+	}
+	if seven.Source != "ccline" || seven.UsedPercent != 10 {
+		t.Fatalf("seven = %+v", seven)
+	}
+	if f, _ := Latest(status, nil); f.Source != "status line" || f.UsedPercent != 1 {
+		t.Fatalf("status only = %+v", f)
+	}
+	if _, ok := CclineCache(t.TempDir()); ok {
+		t.Fatalf("missing cache read as present")
+	}
+}

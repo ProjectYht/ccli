@@ -240,18 +240,34 @@ func cmdResume(ctx context.Context, a *app, args []string) error {
 	fs := newFlags("resume", a, &c)
 	printOnly := fs.Bool("print", false, "print the command instead of running it")
 	fork := fs.Bool("fork", false, "resume into a new session id (--fork-session)")
+	in := fs.String("a", "", "resume in this account (its copy must be up to date, or use --sync)")
+	syncCopy := fs.Bool("sync", false, "with -a: first bring that account's copy up to date from the newest copy")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
-		return errors.New("usage: ccli resume [-print] [-fork] <session id or prefix>")
+		return errors.New("usage: ccli resume [-a account [--sync]] [-print] [-fork] <session id or prefix>")
 	}
 	svc, err := a.prepare(ctx, c, nil)
 	if err != nil {
 		return err
 	}
-	d, err := svc.Session(ctx, pos[0])
+	ref := pos[0]
+	if *in != "" {
+		_, id, err := svc.Resolve(ctx, ref)
+		if err != nil {
+			a.close()
+			return err
+		}
+		if err := a.syncFor(ctx, id, *in, *syncCopy); err != nil {
+			a.close()
+			return err
+		}
+		svc = query.New(a.st, a.accts)
+		ref = *in + ":" + id
+	}
+	d, err := svc.Session(ctx, ref)
 	a.close()
 	if err != nil {
 		return err

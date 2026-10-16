@@ -20,6 +20,7 @@ type Mode int
 const (
 	Copy Mode = iota
 	Move
+	ForkMode // a copy under a new session id
 )
 
 // Action is what Plan decided to do with the transcript.
@@ -29,6 +30,7 @@ const (
 	Create      Action = "create"       // target has no transcript
 	FastForward Action = "fast-forward" // target transcript is a prefix of the source
 	UpToDate    Action = "up-to-date"   // identical transcript
+	Forked      Action = "fork"         // copied under a new session id
 	Refuse      Action = "refuse"
 )
 
@@ -55,6 +57,9 @@ type Options struct {
 	ArchiveDir string
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
+	// Intend, when set, is told about each transcript range before it is
+	// written (see Intend).
+	Intend Intend
 }
 
 // Result is what Apply did.
@@ -65,7 +70,16 @@ type Result struct {
 	Conflicts []string `json:"conflicts"` // target files left alone because they differ and are not a prefix of the source
 	Archive   string   `json:"archive,omitempty"`
 	Removed   []string `json:"removed,omitempty"`
+	Imports   []Import `json:"imports,omitempty"` // transcript bytes written into the target
+
+	intend Intend
 }
+
+// Intend is called with the transcript bytes a copy is about to write, before
+// the file is put in place. An error abandons that file; undo (when not nil)
+// is called if putting it in place then fails. It lets the caller record the
+// copy before the bytes exist, so nothing can read them unrecorded.
+type Intend func(Import) (undo func(), err error)
 
 const (
 	reasonSameDir   = "source and target are the same directory"
@@ -73,7 +87,7 @@ const (
 	reasonMissing   = "transcript not found in source"
 	reasonLive      = "a Claude Code process is running this session"
 	reasonNewer     = "target has a newer copy; move it the other way"
-	reasonDiverged  = "the copies diverged; resume one with --fork-session instead"
+	reasonDiverged  = "the copies diverged; continue one as a new session with ccli fork"
 	reasonNoArchive = "archive dir is required for move"
 	reasonShared    = "the two accounts share these folders (a symlink); nothing to copy"
 	reasonOtherKey  = "the target holds this session under another project folder (%s)"
@@ -219,18 +233,18 @@ func Apply(op Op, opt Options) (Result, error) {
 		Written:   []string{},
 		Skipped:   []string{},
 		Conflicts: []string{},
+		intend:    opt.Intend,
 	}
 	if planned.Action == Create || planned.Action == FastForward {
 		if err := checkParents(planned.to.Dir, dst.transcript); err != nil {
 			return Result{}, err
 		}
-		if err := copyRegular(src.Transcript, dst.transcript); err != nil {
+		if err := copyTranscript(src.Transcript, dst.transcript, &res); err != nil {
 			return Result{}, err
 		}
-		res.Written = append(res.Written, dst.transcript)
 	}
-	if src.SidecarDir != "" {
-		if err := mergeTree(src.SidecarDir, src.Account.Dir, planned.to.Dir, &res); err != nil {
+	for _, dir := range src.sidecars() {
+		if err := mergeTree(dir, src.Account.Dir, planned.to.Dir, &res); err != nil {
 			return res, err
 		}
 	}
@@ -261,7 +275,7 @@ func Apply(op Op, opt Options) (Result, error) {
 	if st != Same {
 		return res, fmt.Errorf("copy %s: target transcript does not match the source", dst.transcript)
 	}
-	for _, root := range []string{src.SidecarDir, src.FileHistory} {
+	for _, root := range append(src.sidecars(), src.FileHistory) {
 		if err := verifyTree(root, src.Account.Dir, planned.to.Dir); err != nil {
 			return res, err
 		}
@@ -376,11 +390,7 @@ func mergeFile(src, dst string, res *Result) error {
 	_, err := os.Lstat(dst)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			if err := copyRegular(src, dst); err != nil {
-				return err
-			}
-			res.Written = append(res.Written, dst)
-			return nil
+			return copyTranscript(src, dst, res)
 		}
 		return fmt.Errorf("copy %s: %w", dst, err)
 	}
@@ -392,10 +402,7 @@ func mergeFile(src, dst string, res *Result) error {
 	case Same:
 		res.Skipped = append(res.Skipped, dst)
 	case AAhead:
-		if err := copyRegular(src, dst); err != nil {
-			return err
-		}
-		res.Written = append(res.Written, dst)
+		return copyTranscript(src, dst, res)
 	default:
 		res.Conflicts = append(res.Conflicts, dst)
 	}
@@ -488,7 +495,8 @@ func archiveSource(src Files, archiveDir, root string) ([]string, error) {
 	}
 	// The transcript goes last: if an earlier step fails, the session is still
 	// in the source and the move can simply be run again.
-	for _, path := range []string{src.FileHistory, src.SidecarDir, src.Transcript} {
+	paths := append(append([]string{src.FileHistory}, src.sidecars()...), src.Transcript)
+	for _, path := range paths {
 		if path == "" {
 			continue
 		}
@@ -510,14 +518,17 @@ func archiveSource(src Files, archiveDir, root string) ([]string, error) {
 	return removed, nil
 }
 
-// sessionRel reports whether rel is the transcript, the sidecar directory,
-// or the file-history directory of this session. Memory and other sessions
-// are not session paths.
+// sessionRel reports whether rel is the transcript, a session folder under
+// projects/ (the transcript's key or another), or the file-history directory
+// of this session. Memory and other sessions are not session paths.
 func sessionRel(rel, key, id string) bool {
 	rel = filepath.Clean(rel)
-	return rel == filepath.Join("projects", key, id+".jsonl") ||
-		rel == filepath.Join("projects", key, id) ||
-		rel == filepath.Join("file-history", id)
+	if rel == filepath.Join("projects", key, id+".jsonl") || rel == filepath.Join("file-history", id) {
+		return true
+	}
+	dir, base := filepath.Split(rel)
+	proj, k := filepath.Split(filepath.Clean(dir))
+	return base == id && filepath.Clean(proj) == "projects" && validKey(k)
 }
 
 func sessionTree(src Files) ([]string, error) {
@@ -551,7 +562,7 @@ func sessionTree(src Files) ([]string, error) {
 			return nil
 		})
 	}
-	for _, p := range []string{src.Transcript, src.SidecarDir, src.FileHistory} {
+	for _, p := range append(append([]string{src.Transcript}, src.sidecars()...), src.FileHistory) {
 		if err := walk(p); err != nil {
 			return nil, err
 		}
@@ -643,4 +654,35 @@ func mkdirAll(path string) error {
 		return err
 	}
 	return os.Chmod(path, 0o700)
+}
+
+// copyTranscript copies src over dst (see copyRegular) and, for a
+// transcript (.jsonl), records the bytes the target did not have before.
+func copyTranscript(src, dst string, res *Result) error {
+	var before int64
+	if st, err := os.Lstat(dst); err == nil && st.Mode().IsRegular() {
+		before = st.Size()
+	}
+	jsonl := strings.HasSuffix(dst, ".jsonl")
+	var undo func()
+	if jsonl && res.intend != nil {
+		if st, err := os.Stat(src); err == nil && st.Size() > before {
+			if undo, err = res.intend(Import{Path: dst, From: before, To: st.Size()}); err != nil {
+				return fmt.Errorf("record the copy of %s: %w", dst, err)
+			}
+		}
+	}
+	if err := copyRegular(src, dst); err != nil {
+		if undo != nil {
+			undo()
+		}
+		return err
+	}
+	res.Written = append(res.Written, dst)
+	if jsonl {
+		if st, err := os.Stat(dst); err == nil && st.Size() > before {
+			res.Imports = append(res.Imports, Import{Path: dst, From: before, To: st.Size()})
+		}
+	}
+	return nil
 }

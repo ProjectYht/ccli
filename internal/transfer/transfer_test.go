@@ -897,3 +897,120 @@ func TestSymlinkedTargetFolderRefused(t *testing.T) {
 		t.Fatalf("%d files landed outside the account", len(ents))
 	}
 }
+
+func TestSideFoldersAndImports(t *testing.T) {
+	root := t.TempDir()
+	a := makeAcct(t, root, "default")
+	b := makeAcct(t, root, "work")
+	line1 := `{"type":"user","sessionId":"` + id1 + `"}` + "\n"
+	line2 := `{"type":"assistant","sessionId":"` + id1 + `"}` + "\n"
+	writeFile(t, transcriptPath(a, "proj", id1), line1+line2, time.Time{})
+	writeFile(t, filepath.Join(a.Dir, "projects", "proj", id1, "subagents", "agent-x.jsonl"), line1, time.Time{})
+	// The session moved into a worktree for a while: a side folder.
+	writeFile(t, filepath.Join(a.Dir, "projects", "proj--worktrees-x", id1, "workflows", "scripts", "s-wf_1.js"), "js", time.Time{})
+
+	src, err := Locate(a, id1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.ProjectKey != "proj" || len(src.SideDirs) != 1 || !strings.HasSuffix(src.SideDirs[0], filepath.Join("proj--worktrees-x", id1)) {
+		t.Fatalf("locate: %#v", src)
+	}
+	// The target has an older copy: the first line only.
+	writeFile(t, transcriptPath(b, "proj", id1), line1, time.Time{})
+	op, err := Plan(id1, a, b, Copy, Options{})
+	if err != nil || op.Action != FastForward {
+		t.Fatalf("plan: %+v %v", op, err)
+	}
+	res, err := Apply(op, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isRegular(filepath.Join(b.Dir, "projects", "proj--worktrees-x", id1, "workflows", "scripts", "s-wf_1.js")) {
+		t.Fatalf("side folder not copied: %+v", res.Written)
+	}
+	want := map[string]Import{
+		transcriptPath(b, "proj", id1):                                              {From: int64(len(line1)), To: int64(len(line1 + line2))},
+		filepath.Join(b.Dir, "projects", "proj", id1, "subagents", "agent-x.jsonl"): {From: 0, To: int64(len(line1))},
+	}
+	if len(res.Imports) != len(want) {
+		t.Fatalf("imports = %+v", res.Imports)
+	}
+	for _, im := range res.Imports {
+		w, ok := want[im.Path]
+		if !ok || im.From != w.From || im.To != w.To {
+			t.Fatalf("import %+v, want %+v", im, w)
+		}
+	}
+}
+
+func TestForkRewritesIDAndSkipsPartialLine(t *testing.T) {
+	root := t.TempDir()
+	a := makeAcct(t, root, "default")
+	b := makeAcct(t, root, "work")
+	full := `{"type":"user","sessionId":"` + id1 + `","message":{"content":"see ` + id1 + `"}}` + "\n"
+	partial := `{"type":"assistant","sessionId":"` + id1
+	writeFile(t, transcriptPath(a, "proj", id1), full+partial, time.Time{})
+	writeFile(t, filepath.Join(a.Dir, "projects", "proj", id1, "subagents", "agent-x.jsonl"), `{"session_id":"`+id1+`"}`+"\n", time.Time{})
+	writeFile(t, filepath.Join(a.Dir, "projects", "proj", id1, "subagents", "agent-x.meta.json"), `{"agentType":"x"}`, time.Time{})
+	writeFile(t, filepath.Join(a.Dir, "file-history", id1, "snap"), "s", time.Time{})
+
+	p, err := PlanFork(id1, a, b, id2)
+	if err != nil || p.Reason != "" || p.Folders != 2 {
+		t.Fatalf("plan: %+v %v", p, err)
+	}
+	res, err := Fork(p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(transcriptPath(b, "proj", id2))
+	wantLine := `{"type":"user","sessionId":"` + id2 + `","message":{"content":"see ` + id1 + `"}}` + "\n"
+	if string(got) != wantLine {
+		t.Fatalf("forked transcript = %q", got)
+	}
+	sub, _ := os.ReadFile(filepath.Join(b.Dir, "projects", "proj", id2, "subagents", "agent-x.jsonl"))
+	if string(sub) != `{"session_id":"`+id2+`"}`+"\n" {
+		t.Fatalf("forked subagent = %q", sub)
+	}
+	if !isRegular(filepath.Join(b.Dir, "projects", "proj", id2, "subagents", "agent-x.meta.json")) || !isRegular(filepath.Join(b.Dir, "file-history", id2, "snap")) {
+		t.Fatalf("folders not copied: %v", res.Written)
+	}
+	if len(res.Imports) != 2 || res.Imports[0].From != 0 {
+		t.Fatalf("imports = %+v", res.Imports)
+	}
+	// The source is untouched, and forking again to the same id is refused.
+	if src, _ := os.ReadFile(transcriptPath(a, "proj", id1)); string(src) != full+partial {
+		t.Fatalf("source changed")
+	}
+	if p2, _ := PlanFork(id1, a, b, id2); p2.Reason == "" {
+		t.Fatalf("a second fork to the same id was not refused")
+	}
+	if id, err := NewID(); err != nil || !validID(id) {
+		t.Fatalf("NewID = %q %v", id, err)
+	}
+}
+
+func TestCompleteLines(t *testing.T) {
+	dir := t.TempDir()
+	long := strings.Repeat("x", 200<<10) // a partial line longer than one read
+	for _, c := range []struct {
+		content string
+		want    int64
+	}{
+		{"", 0},
+		{"partial", 0},
+		{"a\nb\n", 4},
+		{"a\nb\npart", 4},
+		{"a\n" + long, 2},
+		{long + "\n" + long, int64(len(long)) + 1},
+	} {
+		p := filepath.Join(dir, "t.jsonl")
+		if err := os.WriteFile(p, []byte(c.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := completeLines(p, int64(len(c.content)))
+		if err != nil || got != c.want {
+			t.Fatalf("completeLines(%d bytes) = %d, %v; want %d", len(c.content), got, err, c.want)
+		}
+	}
+}

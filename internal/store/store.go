@@ -111,7 +111,94 @@ CREATE TABLE IF NOT EXISTS runs(
   results INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(account, session_id, run_id)
 );
+CREATE TABLE IF NOT EXISTS turns(
+  file_id INTEGER NOT NULL, seq INTEGER NOT NULL,
+  offset INTEGER NOT NULL DEFAULT 0, ts INTEGER NOT NULL DEFAULT 0, last_ts INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '', chars INTEGER NOT NULL DEFAULT 0, images INTEGER NOT NULL DEFAULT 0,
+  tool_calls INTEGER NOT NULL DEFAULT 0, agents INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(file_id, seq)
+);
+CREATE TABLE IF NOT EXISTS transfers(
+  id INTEGER PRIMARY KEY, at INTEGER NOT NULL, mode TEXT NOT NULL,
+  session_id TEXT NOT NULL, new_session_id TEXT NOT NULL DEFAULT '',
+  from_account TEXT NOT NULL, to_account TEXT NOT NULL,
+  path TEXT NOT NULL, from_offset INTEGER NOT NULL, to_offset INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS transfers_path ON transfers(path);
+CREATE INDEX IF NOT EXISTS transfers_session ON transfers(session_id);
 `
+
+// columns are added to tables created by earlier versions. The schema only
+// ever grows this way: a new SchemaVersion would set the database aside, and
+// with it the history of transcripts that are gone from disk.
+var columns = []struct{ table, name, def string }{
+	{"files", "turn", "INTEGER NOT NULL DEFAULT 0"},
+	{"files", "replay", "INTEGER NOT NULL DEFAULT 0"},
+	{"turns", "prompt_id", "TEXT NOT NULL DEFAULT ''"},
+	{"turns", "active_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"files", "skill", "TEXT NOT NULL DEFAULT ''"},
+	{"files", "parent_agent", "TEXT NOT NULL DEFAULT ''"},
+	{"files", "phase", "TEXT NOT NULL DEFAULT ''"},
+	{"files", "attribution", "TEXT NOT NULL DEFAULT ''"},
+	{"responses", "turn", "INTEGER NOT NULL DEFAULT 0"},
+	{"responses", "imported", "INTEGER NOT NULL DEFAULT 0"},
+	{"processes", "imported", "INTEGER NOT NULL DEFAULT 0"},
+	{"spawns", "turn", "INTEGER NOT NULL DEFAULT 0"},
+	{"spawns", "tool", "TEXT NOT NULL DEFAULT ''"},
+	{"spawns", "target", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "name", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "status", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "summary", "TEXT NOT NULL DEFAULT ''"},
+	{"runs", "start_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"runs", "duration_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"runs", "agent_count", "INTEGER NOT NULL DEFAULT 0"},
+	{"runs", "journal_mtime", "INTEGER NOT NULL DEFAULT 0"},
+	{"runs", "state_mtime", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+const indexes = `
+CREATE INDEX IF NOT EXISTS responses_file_turn ON responses(file_id, turn);
+CREATE INDEX IF NOT EXISTS spawns_target ON spawns(target);
+`
+
+func migrate(db *sql.DB) error {
+	have := map[string]map[string]bool{}
+	for _, c := range columns {
+		if have[c.table] == nil {
+			cols, err := tableColumns(db, c.table)
+			if err != nil {
+				return err
+			}
+			have[c.table] = cols
+		}
+		if have[c.table][c.name] {
+			continue
+		}
+		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.name, c.def)); err != nil {
+			return err
+		}
+		have[c.table][c.name] = true
+	}
+	_, err := db.Exec(indexes)
+	return err
+}
+
+func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query("SELECT name FROM pragma_table_info(?)", table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out[n] = true
+	}
+	return out, rows.Err()
+}
 
 // Store wraps the database.
 type Store struct {
@@ -159,6 +246,10 @@ func Open(path string) (*Store, error) {
 	}
 	db := s.db
 	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -212,6 +303,8 @@ type File struct {
 	HeadHash   string
 	Parser     int
 	PrevTS     int64
+	Turn       int
+	Replay     bool
 	Missing    bool
 }
 
@@ -222,11 +315,14 @@ type AgentMeta struct {
 	ToolUseID    string
 	SpawnDepth   int
 	RequestShape string
+	Skill        string // a skill run as a subagent (meta "name")
+	ParentAgent  string // the subagent that started this one
+	Phase        string // workflow phase
 }
 
 // Files returns every known file by path.
 func (s *Store) Files() (map[string]File, error) {
-	rows, err := s.db.Query(`SELECT id, path, account, session_id, project_key, kind, agent_id, run_id, size, mtime, offset, head_hash, parser, prev_ts, missing FROM files`)
+	rows, err := s.db.Query(`SELECT id, path, account, session_id, project_key, kind, agent_id, run_id, size, mtime, offset, head_hash, parser, prev_ts, turn, replay, missing FROM files`)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +331,7 @@ func (s *Store) Files() (map[string]File, error) {
 	for rows.Next() {
 		var f File
 		var missing int
-		if err := rows.Scan(&f.ID, &f.Path, &f.Account, &f.SessionID, &f.ProjectKey, &f.Kind, &f.AgentID, &f.RunID, &f.Size, &f.MTime, &f.Offset, &f.HeadHash, &f.Parser, &f.PrevTS, &missing); err != nil {
+		if err := rows.Scan(&f.ID, &f.Path, &f.Account, &f.SessionID, &f.ProjectKey, &f.Kind, &f.AgentID, &f.RunID, &f.Size, &f.MTime, &f.Offset, &f.HeadHash, &f.Parser, &f.PrevTS, &f.Turn, &f.Replay, &missing); err != nil {
 			return nil, err
 		}
 		f.Missing = missing != 0
@@ -254,6 +350,11 @@ type Update struct {
 	From   int64 // offset the parse started at; the update is skipped if another run moved it
 	Result transcript.Result
 	Agent  *AgentMeta
+	// Ledger is the newest transfer id the parse knew of. A transfer
+	// recorded for the file since then means the parse may have counted
+	// copied bytes as the file's own: the file is then stored as needing a
+	// full re-read.
+	Ledger int64
 }
 
 // Apply writes a batch of updates in one transaction.
@@ -295,6 +396,13 @@ func apply(ctx context.Context, tx *sql.Tx, u *Update, cost CostFunc) error {
 	if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO dirty(account, session_id) VALUES(?, ?)", f.Account, f.SessionID); err != nil {
 		return err
 	}
+	var newer bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM transfers WHERE path = ? AND id > ?)", f.Path, u.Ledger).Scan(&newer); err != nil {
+		return err
+	}
+	if newer {
+		f.Parser = 0
+	}
 	if u.Reset {
 		for _, q := range []string{
 			"DELETE FROM responses WHERE file_id = ?",
@@ -303,6 +411,7 @@ func apply(ctx context.Context, tx *sql.Tx, u *Update, cost CostFunc) error {
 			"DELETE FROM links WHERE file_id = ?",
 			"DELETE FROM processes WHERE file_id = ?",
 			"DELETE FROM spawns WHERE file_id = ?",
+			"DELETE FROM turns WHERE file_id = ?",
 		} {
 			if _, err := tx.ExecContext(ctx, q, f.ID); err != nil {
 				return err
@@ -310,7 +419,7 @@ func apply(ctx context.Context, tx *sql.Tx, u *Update, cost CostFunc) error {
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE files SET lines=0, skipped=0, typed_prompts=0, other_prompts=0, tool_calls=0, active_ms=0,
 			first_ts=0, last_ts=0, cwd='', custom_title='', ai_title='', summary='', first_prompt='', team_name='', agent_name='',
-			bridge_session_id='', entrypoint='', version='', git_branch='', cost_state_usd=0, has_cost_state=0 WHERE id = ?`, f.ID); err != nil {
+			bridge_session_id='', entrypoint='', version='', git_branch='', cost_state_usd=0, has_cost_state=0, attribution='' WHERE id = ?`, f.ID); err != nil {
 			return err
 		}
 	}
@@ -320,6 +429,10 @@ func apply(ctx context.Context, tx *sql.Tx, u *Update, cost CostFunc) error {
 	// files it was copied to. Its responses carry the time kept here.
 	if err := tx.QueryRowContext(ctx, `UPDATE files SET born = CASE WHEN ? > 0 AND (born = 0 OR ? < born) THEN ? ELSE born END
 		WHERE id = ? RETURNING born`, f.Born, f.Born, f.Born, f.ID).Scan(&f.Born); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE files SET turn = ?, replay = ?, attribution = CASE WHEN attribution = '' THEN ? ELSE attribution END WHERE id = ?`,
+		r.State.Turn, boolInt(r.State.Replay), r.Attribution, f.ID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE files SET size=?, mtime=?, offset=?, head_hash=?, parser=?, prev_ts=?, missing=0,
@@ -352,8 +465,8 @@ func apply(ctx context.Context, tx *sql.Tx, u *Update, cost CostFunc) error {
 		return err
 	}
 	if a := u.Agent; a != nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE files SET agent_type=?, description=?, tool_use_id=?, spawn_depth=?, request_shape=? WHERE id = ?`,
-			a.AgentType, a.Description, a.ToolUseID, a.SpawnDepth, a.RequestShape, f.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE files SET agent_type=?, description=?, tool_use_id=?, spawn_depth=?, request_shape=?, skill=?, parent_agent=?, phase=? WHERE id = ?`,
+			a.AgentType, a.Description, a.ToolUseID, a.SpawnDepth, a.RequestShape, a.Skill, a.ParentAgent, a.Phase, f.ID); err != nil {
 			return err
 		}
 	}
@@ -364,15 +477,48 @@ func apply(ctx context.Context, tx *sql.Tx, u *Update, cost CostFunc) error {
 		}
 		us := resp.Usage
 		// A response in several files (a copy or fork) belongs to the file
-		// created first; a later line in the owning file may revise its usage.
-		if _, err := tx.ExecContext(ctx, `INSERT INTO responses(key, file_id, account, session_id, kind, ts, model, speed, input, output, cache_read, cache_5m, cache_1h, web_search, cost, born)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		// that made it: a line ccli copied in from another account never owns
+		// it, and among the rest the file created first does. A later line in
+		// the owning file may revise its usage.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO responses(key, file_id, account, session_id, kind, ts, model, speed, input, output, cache_read, cache_5m, cache_1h, web_search, cost, born, turn, imported)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(key) DO UPDATE SET file_id=excluded.file_id, account=excluded.account, session_id=excluded.session_id, kind=excluded.kind,
 			  born=excluded.born, model=excluded.model, speed=excluded.speed, input=excluded.input, output=excluded.output,
-			  cache_read=excluded.cache_read, cache_5m=excluded.cache_5m, cache_1h=excluded.cache_1h, web_search=excluded.web_search, cost=excluded.cost
-			WHERE responses.file_id = excluded.file_id OR (excluded.born > 0 AND (responses.born = 0 OR excluded.born < responses.born))`,
+			  cache_read=excluded.cache_read, cache_5m=excluded.cache_5m, cache_1h=excluded.cache_1h, web_search=excluded.web_search, cost=excluded.cost,
+			  turn=CASE WHEN ? THEN responses.turn ELSE excluded.turn END, imported=excluded.imported
+			WHERE responses.file_id = excluded.file_id OR excluded.imported < responses.imported
+			  OR (excluded.imported = responses.imported AND excluded.born > 0 AND (responses.born = 0 OR excluded.born < responses.born))`,
 			resp.Key, f.ID, f.Account, f.SessionID, f.Kind, resp.TS, resp.Model, resp.Speed,
-			us.Input, us.Output, us.CacheRead, us.Cache5m, us.Cache1h, us.WebSearch, c, f.Born); err != nil {
+			us.Input, us.Output, us.CacheRead, us.Cache5m, us.Cache1h, us.WebSearch, c, f.Born, resp.Turn, boolInt(resp.Imported), resp.Replay); err != nil {
+			return err
+		}
+	}
+	if u.Reset {
+		// This file now holds, as a copy, responses no other file holds: their
+		// own file lost them to this one before the copy was recorded and has
+		// not been read since. Read the copy's source again so it takes them
+		// back (a copied response never wins against its own file).
+		if _, err := tx.ExecContext(ctx, `UPDATE files SET parser = 0 WHERE id <> ? AND id IN (
+				SELECT src.id FROM transfers t JOIN files src ON src.account = t.from_account AND src.session_id = t.session_id AND src.agent_id = ?
+				WHERE t.path = ?)
+			AND EXISTS(SELECT 1 FROM responses WHERE file_id = ? AND imported = 1)`, f.ID, f.AgentID, f.Path, f.ID); err != nil {
+			return err
+		}
+	}
+	for _, t := range r.Turns {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO turns(file_id, seq, offset, ts, last_ts, kind, text, chars, images, prompt_id) VALUES(?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(file_id, seq) DO UPDATE SET offset=excluded.offset, ts=excluded.ts, last_ts=MAX(last_ts, excluded.last_ts),
+			  kind=excluded.kind, text=excluded.text, chars=excluded.chars, images=excluded.images, prompt_id=excluded.prompt_id`,
+			f.ID, t.Seq, t.Offset, t.TS, t.TS, t.Kind, t.Text, t.Chars, t.Images, t.PromptID); err != nil {
+			return err
+		}
+	}
+	for _, seq := range sortedTurns(r.TurnStats) {
+		s := r.TurnStats[seq]
+		if _, err := tx.ExecContext(ctx, `INSERT INTO turns(file_id, seq, last_ts, tool_calls, agents, duration_ms, active_ms) VALUES(?,?,?,?,?,?,?)
+			ON CONFLICT(file_id, seq) DO UPDATE SET last_ts=MAX(last_ts, excluded.last_ts), tool_calls=tool_calls + excluded.tool_calls,
+			  agents=agents + excluded.agents, duration_ms=MAX(duration_ms, excluded.duration_ms), active_ms=active_ms + excluded.active_ms`,
+			f.ID, seq, s.LastTS, s.ToolCalls, s.Agents, s.DurationMS, s.ActiveMS); err != nil {
 			return err
 		}
 	}
@@ -391,13 +537,23 @@ func apply(ctx context.Context, tx *sql.Tx, u *Update, cost CostFunc) error {
 			return err
 		}
 	}
+	for _, kv := range sortedCounts(r.Commands) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tools(file_id, name, skill, n) VALUES(?, 'Command', ?, ?) ON CONFLICT(file_id, name, skill) DO UPDATE SET n = n + excluded.n`, f.ID, kv.k, kv.n); err != nil {
+			return err
+		}
+	}
 	for _, t := range r.ContinuedIn {
 		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO links(file_id, kind, target) VALUES(?, 'continued-in', ?)`, f.ID, t); err != nil {
 			return err
 		}
 	}
-	for _, id := range r.Spawns {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO spawns(file_id, tool_use_id) VALUES(?, ?)`, f.ID, id); err != nil {
+	for _, sp := range r.Spawns {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO spawns(file_id, tool_use_id, turn, tool) VALUES(?, ?, ?, ?)`, f.ID, sp.ToolUseID, sp.Turn, sp.Tool); err != nil {
+			return err
+		}
+	}
+	for _, id := range sortedKeys(r.Targets) {
+		if _, err := tx.ExecContext(ctx, `UPDATE spawns SET target = ? WHERE file_id = ? AND tool_use_id = ?`, r.Targets[id], f.ID, id); err != nil {
 			return err
 		}
 	}
@@ -407,13 +563,31 @@ func apply(ctx context.Context, tx *sql.Tx, u *Update, cost CostFunc) error {
 			return err
 		}
 		for _, m := range p.Models {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO processes(file_id, start_ms, end_ms, model, input, output, cache_read, cache_write, web_search, cost)
-				VALUES(?,?,?,?,?,?,?,?,?,?)`, f.ID, p.Start, p.End, m.Model, m.Input, m.Output, m.CacheRead, m.CacheWrite, m.WebSearch, m.CostUSD); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO processes(file_id, start_ms, end_ms, model, input, output, cache_read, cache_write, web_search, cost, imported)
+				VALUES(?,?,?,?,?,?,?,?,?,?,?)`, f.ID, p.Start, p.End, m.Model, m.Input, m.Output, m.CacheRead, m.CacheWrite, m.WebSearch, m.CostUSD, boolInt(p.Imported)); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func sortedTurns(m map[int]*transcript.TurnStat) []int {
+	out := make([]int, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type kv struct {
@@ -455,13 +629,40 @@ func (s *Store) MarkMissing(ctx context.Context, ids []int64, missing bool) erro
 	return tx.Commit()
 }
 
-// Run is a workflow run's journal summary.
+// Run is a workflow run: counts from its journal, and what its state file
+// records (name, status, summary, start, duration, agent count).
 type Run struct {
 	Account, SessionID, RunID          string
 	Launched, Started, Results, Failed int
+	JournalMTime                       int64 // mtime of the journal the counts came from; 0 = none read
+	Name, Status, Summary              string
+	StartMS, DurationMS                int64
+	AgentCount                         int
+	StateMTime                         int64 // mtime of the state file; 0 = none read
 }
 
-// PutRuns replaces workflow run summaries.
+// Runs returns the stored runs by account, session and run id.
+func (s *Store) Runs() (map[[3]string]Run, error) {
+	rows, err := s.db.Query(`SELECT account, session_id, run_id, launched, started, results, failed, journal_mtime,
+		name, status, summary, start_ms, duration_ms, agent_count, state_mtime FROM runs`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[[3]string]Run{}
+	for rows.Next() {
+		var r Run
+		if err := rows.Scan(&r.Account, &r.SessionID, &r.RunID, &r.Launched, &r.Started, &r.Results, &r.Failed, &r.JournalMTime,
+			&r.Name, &r.Status, &r.Summary, &r.StartMS, &r.DurationMS, &r.AgentCount, &r.StateMTime); err != nil {
+			return nil, err
+		}
+		out[[3]string{r.Account, r.SessionID, r.RunID}] = r
+	}
+	return out, rows.Err()
+}
+
+// PutRuns writes workflow runs. A run's journal counts and state fields are
+// each written only when that file was read (its mtime is set).
 func (s *Store) PutRuns(ctx context.Context, runs []Run) error {
 	if len(runs) == 0 {
 		return nil
@@ -472,13 +673,140 @@ func (s *Store) PutRuns(ctx context.Context, runs []Run) error {
 	}
 	defer tx.Rollback()
 	for _, r := range runs {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO runs(account, session_id, run_id, launched, started, results, failed) VALUES(?,?,?,?,?,?,?)
-			ON CONFLICT(account, session_id, run_id) DO UPDATE SET launched=excluded.launched, started=excluded.started, results=excluded.results, failed=excluded.failed`,
-			r.Account, r.SessionID, r.RunID, r.Launched, r.Started, r.Results, r.Failed); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO runs(account, session_id, run_id) VALUES(?,?,?)`, r.Account, r.SessionID, r.RunID); err != nil {
+			return err
+		}
+		if r.JournalMTime != 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE runs SET launched=?, started=?, results=?, failed=?, journal_mtime=? WHERE account=? AND session_id=? AND run_id=?`,
+				r.Launched, r.Started, r.Results, r.Failed, r.JournalMTime, r.Account, r.SessionID, r.RunID); err != nil {
+				return err
+			}
+		}
+		if r.StateMTime != 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE runs SET name=?, status=?, summary=?, start_ms=?, duration_ms=?, agent_count=?, state_mtime=? WHERE account=? AND session_id=? AND run_id=?`,
+				r.Name, r.Status, r.Summary, r.StartMS, r.DurationMS, r.AgentCount, r.StateMTime, r.Account, r.SessionID, r.RunID); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+// Transfer is one file ccli wrote into an account by copying it from
+// another: bytes [From, To) of Path came from the other account.
+type Transfer struct {
+	At           time.Time `json:"at"`
+	Mode         string    `json:"mode"` // copy, move, fork
+	SessionID    string    `json:"session_id"`
+	NewSessionID string    `json:"new_session_id,omitempty"` // fork only
+	FromAccount  string    `json:"from"`
+	ToAccount    string    `json:"to"`
+	Path         string    `json:"path"`
+	From         int64     `json:"from_offset"`
+	To           int64     `json:"to_offset"`
+}
+
+// RecordTransfers adds entries to the ledger. Usage in those byte ranges
+// stays with the account it came from.
+func (s *Store) RecordTransfers(ctx context.Context, ts []Transfer) error {
+	if len(ts) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, t := range ts {
+		if _, err := recordTransfer(ctx, tx, t); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// RecordTransfer adds one entry to the ledger and returns its id (0 when the
+// range is empty), for DeleteTransfer to take back if the write it records
+// does not happen.
+func (s *Store) RecordTransfer(ctx context.Context, t Transfer) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	id, err := recordTransfer(ctx, tx, t)
+	if err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
+}
+
+// DeleteTransfer removes a ledger entry whose bytes were never written.
+func (s *Store) DeleteTransfer(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM transfers WHERE id = ?`, id)
+	return err
+}
+
+func recordTransfer(ctx context.Context, tx *sql.Tx, t Transfer) (int64, error) {
+	if t.To <= t.From {
+		return 0, nil
+	}
+	var id int64
+	if err := tx.QueryRowContext(ctx, `INSERT INTO transfers(at, mode, session_id, new_session_id, from_account, to_account, path, from_offset, to_offset)
+		VALUES(?,?,?,?,?,?,?,?,?) RETURNING id`, t.At.UnixMilli(), t.Mode, t.SessionID, t.NewSessionID, t.FromAccount, t.ToAccount, t.Path, t.From, t.To).Scan(&id); err != nil {
+		return 0, err
+	}
+	// If an index run read these bytes before they were recorded, read the
+	// file again from the start so they count for the right account. A run
+	// still in flight is caught by Update.Ledger instead.
+	if _, err := tx.ExecContext(ctx, `UPDATE files SET parser = 0 WHERE path = ? AND offset > ?`, t.Path, t.From); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// Imported returns, per file path, the byte ranges ccli copied in, and the
+// newest ledger id they include (see Update.Ledger).
+func (s *Store) Imported() (map[string][]transcript.Range, int64, error) {
+	rows, err := s.db.Query(`SELECT id, path, from_offset, to_offset FROM transfers ORDER BY path, from_offset`)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := map[string][]transcript.Range{}
+	var last int64
+	for rows.Next() {
+		var id int64
+		var p string
+		var r transcript.Range
+		if err := rows.Scan(&id, &p, &r.From, &r.To); err != nil {
+			return nil, 0, err
+		}
+		out[p] = append(out[p], r)
+		last = max(last, id)
+	}
+	return out, last, rows.Err()
+}
+
+// Transfers returns the ledger entries that involve a session, oldest first.
+func (s *Store) Transfers(ctx context.Context, sessionID string) ([]Transfer, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT at, mode, session_id, new_session_id, from_account, to_account, path, from_offset, to_offset
+		FROM transfers WHERE session_id = ? OR new_session_id = ? ORDER BY at, id`, sessionID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Transfer
+	for rows.Next() {
+		var t Transfer
+		var at int64
+		if err := rows.Scan(&at, &t.Mode, &t.SessionID, &t.NewSessionID, &t.FromAccount, &t.ToAccount, &t.Path, &t.From, &t.To); err != nil {
+			return nil, err
+		}
+		t.At = time.UnixMilli(at)
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // Reprice recomputes every stored cost with a new price table, records the
@@ -547,4 +875,23 @@ func openDB(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	return &Store{db: db}, nil
+}
+
+// PromptIDs returns the promptIds that started turns in a file, which an
+// incremental parse needs to recognise a replayed stretch.
+func (s *Store) PromptIDs(fileID int64) (map[string]bool, error) {
+	rows, err := s.db.Query("SELECT prompt_id FROM turns WHERE file_id = ? AND prompt_id <> ''", fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }

@@ -327,3 +327,78 @@ func readStatusInput(r io.Reader) (head []byte, replay io.Reader, parse bool) {
 	}
 	return head, bytes.NewReader(head), true
 }
+
+// Reading is one window's usage as last reported, from whichever source
+// reported it most recently.
+type Reading struct {
+	UsedPercent float64   `json:"used_percent"`
+	ResetsAt    time.Time `json:"resets_at,omitempty"` // zero when the source did not say
+	At          time.Time `json:"reported_at"`
+	Source      string    `json:"source"` // "status line" or "ccline"
+}
+
+// Expired reports whether the window has reset since the reading.
+func (r Reading) Expired(now time.Time) bool { return !r.ResetsAt.IsZero() && !now.Before(r.ResetsAt) }
+
+// CclineCache reads the usage cache that ccline (a status line program,
+// https://github.com/Haleclipse/CCometixLine) keeps in an account's config
+// dir: <dir>/ccline/.api_usage_cache.json. It holds the 5-hour and weekly
+// percentages from Claude's usage API and the weekly reset time; ccli reads
+// only those numbers. ok is false when there is no such file.
+func CclineCache(dir string) (Snapshot, bool) {
+	b, err := os.ReadFile(filepath.Join(dir, "ccline", ".api_usage_cache.json"))
+	if err != nil {
+		return Snapshot{}, false
+	}
+	var v struct {
+		Five     *float64  `json:"five_hour_utilization"`
+		Seven    *float64  `json:"seven_day_utilization"`
+		ResetsAt time.Time `json:"resets_at"` // the weekly window's
+		CachedAt time.Time `json:"cached_at"`
+	}
+	if json.Unmarshal(b, &v) != nil || v.CachedAt.IsZero() {
+		return Snapshot{}, false
+	}
+	s := Snapshot{CapturedAt: v.CachedAt}
+	if v.Five != nil {
+		s.FiveHour = &Window{UsedPercent: *v.Five}
+	}
+	if v.Seven != nil {
+		s.SevenDay = &Window{UsedPercent: *v.Seven, ResetsAt: v.ResetsAt}
+	}
+	return s, s.FiveHour != nil || s.SevenDay != nil
+}
+
+// Latest picks, for each window, the most recent of the status line
+// snapshot and the ccline cache. A reading without a reset time borrows the
+// other source's when that is still ahead of the reading.
+func Latest(status, ccline *Snapshot) (five, seven *Reading) {
+	pick := func(get func(*Snapshot) *Window) *Reading {
+		var out, other *Reading
+		for _, src := range []struct {
+			s    *Snapshot
+			name string
+		}{{status, "status line"}, {ccline, "ccline"}} {
+			if src.s == nil {
+				continue
+			}
+			w := get(src.s)
+			if w == nil {
+				continue
+			}
+			r := &Reading{UsedPercent: w.UsedPercent, ResetsAt: w.ResetsAt, At: src.s.CapturedAt, Source: src.name}
+			if out == nil || r.At.After(out.At) {
+				out, other = r, out
+			} else {
+				other = r
+			}
+		}
+		if out != nil && out.ResetsAt.IsZero() && other != nil && other.ResetsAt.After(out.At) {
+			out.ResetsAt = other.ResetsAt
+		}
+		return out
+	}
+	five = pick(func(s *Snapshot) *Window { return s.FiveHour })
+	seven = pick(func(s *Snapshot) *Window { return s.SevenDay })
+	return five, seven
+}

@@ -24,7 +24,7 @@ import (
 
 // ParserVersion changes when parsing changes; files parsed by an older version
 // are read again from the start.
-const ParserVersion = 1
+const ParserVersion = 2
 
 const headBytes = 4096
 
@@ -49,11 +49,13 @@ type Stats struct {
 }
 
 type job struct {
-	file  store.File
-	reset bool
-	from  int64
-	state transcript.State
-	meta  string // path of the subagent's .meta.json, if any
+	file     store.File
+	reset    bool
+	from     int64
+	state    transcript.State
+	meta     string             // path of the subagent's .meta.json, if any
+	imported []transcript.Range // byte ranges ccli copied in from another account
+	ledger   int64              // the newest ledger entry when imported was read
 }
 
 // Run brings the store up to date for the given accounts.
@@ -64,11 +66,19 @@ func Run(ctx context.Context, st *store.Store, accts []account.Account, prices *
 	if err != nil {
 		return stats, err
 	}
+	knownRuns, err := st.Runs()
+	if err != nil {
+		return stats, err
+	}
+	imported, ledger, err := st.Imported()
+	if err != nil {
+		return stats, err
+	}
 	var jobs []job
 	var runs []store.Run
 	seen := map[string]bool{}
 	for _, a := range accts {
-		found, rs, err := scan(a)
+		found, rs, err := scan(a, knownRuns, opt.Rebuild)
 		if err != nil {
 			return stats, err
 		}
@@ -77,6 +87,12 @@ func Run(ctx context.Context, st *store.Store, accts []account.Account, prices *
 			seen[d.file.Path] = true
 			stats.Files++
 			if j, ok := plan(d, known[d.file.Path], opt.Rebuild); ok {
+				j.imported, j.ledger = imported[d.file.Path], ledger
+				if j.file.Kind == "main" && !j.reset && j.file.ID != 0 {
+					if j.state.Prompts, err = st.PromptIDs(j.file.ID); err != nil {
+						return stats, err
+					}
+				}
 				jobs = append(jobs, j)
 			}
 		}
@@ -133,8 +149,9 @@ type discovered struct {
 	meta string
 }
 
-// scan lists an account's transcript files and workflow journals.
-func scan(a account.Account) ([]discovered, []store.Run, error) {
+// scan lists an account's transcript files, and reads the workflow journals
+// and run state files that changed since they were last read.
+func scan(a account.Account, known map[[3]string]store.Run, rebuild bool) ([]discovered, []store.Run, error) {
 	root := filepath.Join(a.Dir, "projects")
 	projects, err := os.ReadDir(root)
 	if err != nil {
@@ -144,7 +161,24 @@ func scan(a account.Account) ([]discovered, []store.Run, error) {
 		return nil, nil, err
 	}
 	var out []discovered
-	var runs []store.Run
+	runs := map[[3]string]*store.Run{}
+	run := func(session, id string) (*store.Run, store.Run) {
+		k := [3]string{a.Name, session, id}
+		r := runs[k]
+		if r == nil {
+			r = &store.Run{Account: a.Name, SessionID: session, RunID: id}
+			runs[k] = r
+		}
+		return r, known[k]
+	}
+	changed := func(path string, last int64) (int64, bool) {
+		st, err := os.Stat(path)
+		if err != nil || !st.Mode().IsRegular() {
+			return 0, false
+		}
+		mt := st.ModTime().UnixNano()
+		return mt, rebuild || mt != last
+	}
 	add := func(path, session, key, kind, agent, run, meta string) {
 		st, err := os.Stat(path)
 		if err != nil || !st.Mode().IsRegular() {
@@ -175,6 +209,22 @@ func scan(a account.Account) ([]discovered, []store.Run, error) {
 				continue
 			}
 			session := name
+			// Run state files sit beside the subagents folder, under whichever
+			// project folder the session was in when the run started.
+			if states, err := os.ReadDir(filepath.Join(dir, session, "workflows")); err == nil {
+				for _, s := range states {
+					id, ok := strings.CutSuffix(s.Name(), ".json")
+					if s.IsDir() || !ok || !strings.HasPrefix(id, "wf_") {
+						continue
+					}
+					r, old := run(session, id)
+					path := filepath.Join(dir, session, "workflows", s.Name())
+					if mt, ok := changed(path, old.StateMTime); ok {
+						readState(path, r)
+						r.StateMTime = mt
+					}
+				}
+			}
 			sub := filepath.Join(dir, session, "subagents")
 			agents, err := os.ReadDir(sub)
 			if err != nil {
@@ -196,8 +246,8 @@ func scan(a account.Account) ([]discovered, []store.Run, error) {
 				if !w.IsDir() {
 					continue
 				}
-				run := w.Name()
-				rdir := filepath.Join(wfRoot, run)
+				runID := w.Name()
+				rdir := filepath.Join(wfRoot, runID)
 				files, err := os.ReadDir(rdir)
 				if err != nil {
 					continue
@@ -206,25 +256,65 @@ func scan(a account.Account) ([]discovered, []store.Run, error) {
 					fn := fe.Name()
 					switch {
 					case fn == "journal.jsonl":
-						runs = append(runs, journal(filepath.Join(rdir, fn), a.Name, session, run))
+						r, old := run(session, runID)
+						path := filepath.Join(rdir, fn)
+						if mt, ok := changed(path, old.JournalMTime); ok {
+							journal(path, r)
+							r.JournalMTime = mt
+						}
 					case strings.HasPrefix(fn, "agent-") && strings.HasSuffix(fn, ".jsonl"):
 						id := strings.TrimSuffix(strings.TrimPrefix(fn, "agent-"), ".jsonl")
-						add(filepath.Join(rdir, fn), session, key, "workflow", id, run, filepath.Join(rdir, "agent-"+id+".meta.json"))
+						add(filepath.Join(rdir, fn), session, key, "workflow", id, runID, filepath.Join(rdir, "agent-"+id+".meta.json"))
 					}
 				}
 			}
 		}
 	}
-	return out, runs, nil
+	list := make([]store.Run, 0, len(runs))
+	for _, r := range runs {
+		if r.JournalMTime != 0 || r.StateMTime != 0 {
+			list = append(list, *r)
+		}
+	}
+	return out, list, nil
+}
+
+// readState reads what a workflow run's state file says about it.
+func readState(path string, r *store.Run) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var v struct {
+		Name       string `json:"workflowName"`
+		Status     string `json:"status"`
+		Summary    string `json:"summary"`
+		StartTime  int64  `json:"startTime"`
+		DurationMS int64  `json:"durationMs"`
+		AgentCount int    `json:"agentCount"`
+	}
+	if json.Unmarshal(b, &v) != nil {
+		return
+	}
+	r.Name, r.Status, r.Summary = v.Name, v.Status, clean(v.Summary, 300)
+	r.StartMS, r.DurationMS, r.AgentCount = v.StartTime, v.DurationMS, v.AgentCount
+}
+
+func clean(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > n {
+		s = string(r[:n])
+	}
+	return s
 }
 
 // journal counts a workflow run's events.
-func journal(path, acct, session, run string) store.Run {
-	r := store.Run{Account: acct, SessionID: session, RunID: run}
+func journal(path string, r *store.Run) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return r
+		return
 	}
+	r.Launched, r.Started, r.Results, r.Failed = 0, 0, 0, 0
 	for _, ln := range strings.Split(string(b), "\n") {
 		var v struct {
 			Type string `json:"type"`
@@ -243,7 +333,6 @@ func journal(path, acct, session, run string) store.Run {
 			r.Failed++
 		}
 	}
-	return r
 }
 
 // plan decides what to read from a file.
@@ -260,7 +349,7 @@ func plan(d discovered, old store.File, rebuild bool) (job, bool) {
 	}
 	if f.Size == old.Offset {
 		if old.Missing {
-			j.from, j.state = old.Offset, transcript.State{PrevTS: old.PrevTS}
+			j.from, j.state = old.Offset, transcript.State{PrevTS: old.PrevTS, Turn: old.Turn, Replay: old.Replay}
 			return j, true // reappeared unchanged: clear the missing flag
 		}
 		return j, false
@@ -272,7 +361,7 @@ func plan(d discovered, old store.File, rebuild bool) (job, bool) {
 			return j, true
 		}
 	}
-	j.from, j.state = old.Offset, transcript.State{PrevTS: old.PrevTS}
+	j.from, j.state = old.Offset, transcript.State{PrevTS: old.PrevTS, Turn: old.Turn, Replay: old.Replay}
 	return j, true
 }
 
@@ -403,11 +492,12 @@ func parseOne(j job) parsed {
 	case "workflow":
 		kind = transcript.Workflow
 	}
+	j.state.Base, j.state.Imported = from, j.imported
 	res, err := transcript.Parse(f, kind, j.state)
 	if err != nil {
 		return parsed{err: err}
 	}
-	up := store.Update{File: j.file, Reset: j.reset, From: from, Result: res}
+	up := store.Update{File: j.file, Reset: j.reset, From: from, Result: res, Ledger: j.ledger}
 	up.File.Offset = from + res.Consumed
 	up.File.Parser = ParserVersion
 	if up.File.Offset > 0 {
@@ -432,9 +522,13 @@ func readMeta(path string) *store.AgentMeta {
 		ToolUseID    string `json:"toolUseId"`
 		SpawnDepth   int    `json:"spawnDepth"`
 		RequestShape string `json:"requestShape"`
+		Name         string `json:"name"`
+		Parent       string `json:"parentAgentId"`
+		Phase        string `json:"workflowPhase"`
 	}
 	if json.Unmarshal(b, &v) != nil {
 		return nil
 	}
-	return &store.AgentMeta{AgentType: v.AgentType, Description: v.Description, ToolUseID: v.ToolUseID, SpawnDepth: v.SpawnDepth, RequestShape: v.RequestShape}
+	return &store.AgentMeta{AgentType: v.AgentType, Description: v.Description, ToolUseID: v.ToolUseID, SpawnDepth: v.SpawnDepth,
+		RequestShape: v.RequestShape, Skill: v.Name, ParentAgent: v.Parent, Phase: v.Phase}
 }

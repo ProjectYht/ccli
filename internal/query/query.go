@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lr00rl/ccli/internal/account"
@@ -160,7 +161,15 @@ type DB struct {
 	st    *store.Store
 	accts []account.Account
 	live  map[string]account.Live // session id -> live process
+
+	cacheMu sync.Mutex
+	cache   map[string]*SessionDetail // by ref; nil unless CacheSessions was called
 }
+
+// CacheSessions makes Session keep what it loads for the life of the DB, so
+// a browser that reads one session many times builds its graph once. Call it
+// before the DB is shared; details are read-only once built.
+func (d *DB) CacheSessions() { d.cache = map[string]*SessionDetail{} }
 
 // New builds a Service over the store.
 func New(st *store.Store, accts []account.Account) *DB {

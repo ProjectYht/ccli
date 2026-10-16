@@ -25,6 +25,26 @@ type Files struct {
 	Transcript  string // absolute path, "" when absent
 	SidecarDir  string // absolute path, "" when absent
 	FileHistory string // absolute path, "" when absent
+	// SideDirs are the session's folders under other project keys
+	// (projects/<other key>/<id>/), absolute paths.
+	SideDirs []string
+}
+
+// sidecars is every session folder under projects/: the transcript's and
+// the side folders.
+func (f Files) sidecars() []string {
+	var out []string
+	if f.SidecarDir != "" {
+		out = append(out, f.SidecarDir)
+	}
+	return append(out, f.SideDirs...)
+}
+
+// Import is a byte range of a transcript file that a copy wrote into the
+// target. The index leaves usage in it with the account it came from.
+type Import struct {
+	Path     string `json:"path"`
+	From, To int64
 }
 
 // State is how two accounts' copies of one session compare.
@@ -54,6 +74,10 @@ var (
 	errMultiple  = errors.New("session found under more than one project key")
 )
 
+// IsNotFound reports whether err is Locate saying the account has no such
+// session, as opposed to failing to look.
+func IsNotFound(err error) bool { return errors.Is(err, errNotFound) }
+
 // sessionIDPattern matches a lowercase session UUID.
 var sessionIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -75,7 +99,10 @@ func Locate(a account.Account, sessionID string) (Files, error) {
 		}
 		return Files{}, fmt.Errorf("read %s: %w", root, err)
 	}
-	var keys []string
+	// A session's transcript sits under one project folder. When its working
+	// folder changed during the session, Claude Code also made side folders
+	// (workflow scripts and the like) under the other folders' keys.
+	var withTranscript, withDir []string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -85,19 +112,38 @@ func Locate(a account.Account, sessionID string) (Files, error) {
 			continue
 		}
 		dir := filepath.Join(root, key)
-		if isRegular(filepath.Join(dir, sessionID+".jsonl")) || isDir(filepath.Join(dir, sessionID)) {
-			keys = append(keys, key)
+		if isRegular(filepath.Join(dir, sessionID+".jsonl")) {
+			withTranscript = append(withTranscript, key)
+		}
+		if isDir(filepath.Join(dir, sessionID)) {
+			withDir = append(withDir, key)
 		}
 	}
-	if len(keys) == 0 {
+	sort.Strings(withTranscript)
+	sort.Strings(withDir)
+	var key string
+	switch {
+	case len(withTranscript) > 1:
+		return Files{}, fmt.Errorf("%w: %s (%s)", errMultiple, sessionID, strings.Join(withTranscript, ", "))
+	case len(withTranscript) == 1:
+		key = withTranscript[0]
+	case len(withDir) > 1:
+		return Files{}, fmt.Errorf("%w: %s (%s)", errMultiple, sessionID, strings.Join(withDir, ", "))
+	case len(withDir) == 1:
+		key = withDir[0]
+	default:
 		return Files{}, fmt.Errorf("%w %q", errNotFound, sessionID)
 	}
-	if len(keys) > 1 {
-		sort.Strings(keys)
-		return Files{}, fmt.Errorf("%w: %s (%s)", errMultiple, sessionID, strings.Join(keys, ", "))
-	}
-	key := keys[0]
 	out := Files{Account: a, SessionID: sessionID, ProjectKey: key}
+	for _, k := range withDir {
+		if k != key {
+			d, err := filepath.Abs(filepath.Join(root, k, sessionID))
+			if err != nil {
+				return Files{}, fmt.Errorf("read %s: %w", d, err)
+			}
+			out.SideDirs = append(out.SideDirs, d)
+		}
+	}
 	transcript := filepath.Join(root, key, sessionID+".jsonl")
 	if isRegular(transcript) {
 		out.Transcript, err = filepath.Abs(transcript)
@@ -418,3 +464,7 @@ func sameDir(a, b string) bool {
 	}
 	return filepath.Clean(aa) == filepath.Clean(bb)
 }
+
+// Relation compares two transcripts by bytes: AAhead when b is a prefix of
+// a, BAhead when a is a prefix of b.
+func Relation(a, b string) (State, error) { return byteState(a, b) }

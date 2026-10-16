@@ -383,3 +383,216 @@ func TestOwnershipSurvivesReplacedFile(t *testing.T) {
 		t.Fatalf("default holds %d adjustments, want 1", n)
 	}
 }
+
+// A session started in one account, continued in a second, then brought back
+// and continued in the first: each account keeps exactly the work it did.
+func TestPingPongBetweenAccountsKeepsOwnership(t *testing.T) {
+	e := newEnv(t, "default", "work")
+	ctx := context.Background()
+	record := func(to int, from, upto int64) {
+		t.Helper()
+		names := []string{"default", "work"}
+		err := e.st.RecordTransfers(ctx, []store.Transfer{{At: time.Now(), Mode: "copy", SessionID: "s1",
+			FromAccount: names[1-to], ToAccount: names[to], Path: e.path(to, "-p/s1.jsonl"), From: from, To: upto}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	replace := func(acct int, content string) {
+		t.Helper()
+		tmp := e.path(acct, "-p/.s1.tmp")
+		os.MkdirAll(filepath.Dir(tmp), 0o755)
+		if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, e.path(acct, "-p/s1.jsonl")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	startB := time.Date(2026, 10, 1, 9, 2, 30, 0, time.UTC).UnixMilli()
+
+	a1 := prompt(0, "start") + asst(1, "m1", 10) + asst(2, "m2", 10)
+	e.write(0, "-p/s1.jsonl", a1)
+	e.run()
+	time.Sleep(20 * time.Millisecond)
+
+	// Copy to work, which continues the session.
+	replace(1, a1)
+	record(1, 0, int64(len(a1)))
+	e.run()
+	b1 := a1 + prompt(3, "go on in work") + asst(4, "m3", 10) + asst(5, "m4", 10) + costState(startB, 100, 1_000_000, 0)
+	replace(1, b1)
+	e.run()
+
+	// Bring it back to default (a fast-forward) and continue there.
+	replace(0, b1)
+	record(0, int64(len(a1)), int64(len(b1)))
+	e.run()
+	e.appendTo(0, "-p/s1.jsonl", prompt(6, "back home")+asst(7, "m5", 10))
+	e.run()
+
+	owners := map[string]string{}
+	rows, err := e.st.DB().Query("SELECT key, account FROM responses WHERE kind <> 'adjustment'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var k, a string
+		rows.Scan(&k, &a)
+		owners[k] = a
+	}
+	rows.Close()
+	want := map[string]string{"m1": "default", "m2": "default", "m3": "work", "m4": "work", "m5": "default"}
+	for k, a := range want {
+		if owners[k] != a {
+			t.Fatalf("%s owned by %q, want %q (all: %v)", k, owners[k], a, owners)
+		}
+	}
+	if n := e.int("SELECT COUNT(*) FROM responses WHERE kind = 'adjustment' AND account = 'work'"); n != 1 {
+		t.Fatalf("work holds %d adjustments for its own process, want 1", n)
+	}
+	if n := e.int("SELECT COUNT(*) FROM responses WHERE kind = 'adjustment' AND account = 'default'"); n != 0 {
+		t.Fatalf("default holds %d adjustments for work's process, want 0", n)
+	}
+	// Turns are numbered per file: default sees all three prompts.
+	if n := e.int("SELECT COUNT(*) FROM turns t JOIN files f ON f.id = t.file_id WHERE f.account = 'default' AND t.kind = 'human'"); n != 3 {
+		t.Fatalf("default has %d turns, want 3", n)
+	}
+}
+
+func TestWorkflowStateAndJournal(t *testing.T) {
+	e := newEnv(t, "default")
+	e.write(0, "-p/s1.jsonl", prompt(0, "run it")+asst(1, "m1", 10))
+	e.write(0, "-p/s1/workflows/wf_00000001-abc.json", `{"runId":"wf_00000001-abc","script":"x","workflowName":"lanes","status":"completed","summary":"Build   the lanes","startTime":1790000000000,"durationMs":61000,"agentCount":3}`)
+	e.write(0, "-p/s1/subagents/workflows/wf_00000001-abc/journal.jsonl", `{"type":"launched"}`+"\n"+`{"type":"started","agentId":"a1"}`+"\n"+`{"type":"started","agentId":"a2"}`+"\n"+`{"type":"result","agentId":"a1"}`+"\n")
+	e.run()
+	var name, status, summary string
+	var started, results int
+	var dur int64
+	if err := e.st.DB().QueryRow("SELECT name, status, summary, duration_ms, started, results FROM runs WHERE run_id = 'wf_00000001-abc'").Scan(&name, &status, &summary, &dur, &started, &results); err != nil {
+		t.Fatal(err)
+	}
+	if name != "lanes" || status != "completed" || summary != "Build the lanes" || dur != 61000 || started != 2 || results != 1 {
+		t.Fatalf("run = %q %q %q %d %d %d", name, status, summary, dur, started, results)
+	}
+	// Unchanged files are not read again, and a second run keeps the values.
+	e.run()
+	if n := e.int("SELECT started FROM runs WHERE run_id = 'wf_00000001-abc'"); n != 2 {
+		t.Fatalf("started = %d after a second run", n)
+	}
+	e.appendTo(0, "-p/s1/subagents/workflows/wf_00000001-abc/journal.jsonl", `{"type":"failed","agentId":"a2"}`+"\n")
+	e.run()
+	if n := e.int("SELECT failed FROM runs WHERE run_id = 'wf_00000001-abc'"); n != 1 {
+		t.Fatalf("failed = %d after the journal grew", n)
+	}
+	if s := e.int("SELECT COUNT(*) FROM runs WHERE name = 'lanes' AND status = 'completed'"); s != 1 {
+		t.Fatalf("state fields lost when only the journal was read again")
+	}
+}
+
+func owners(t *testing.T, e *env) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	rows, err := e.st.DB().Query("SELECT key, account FROM responses WHERE kind <> 'adjustment'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k, a string
+		rows.Scan(&k, &a)
+		out[k] = a
+	}
+	return out
+}
+
+// A fast-forward copied back with its ledger entry recorded only afterwards
+// (the copy was indexed in between): the work done in the other account goes
+// back to it once the entry exists, although its own file never changed.
+func TestLateLedgerHandsResponsesBack(t *testing.T) {
+	e := newEnv(t, "default", "work")
+	a1 := prompt(0, "start") + asst(1, "m1", 10) + asst(2, "m2", 10)
+	b1 := a1 + prompt(3, "go on in work") + asst(4, "m3", 10) + asst(5, "m4", 10)
+	e.write(0, "-p/s1.jsonl", a1)
+	e.run()
+	time.Sleep(20 * time.Millisecond)
+	e.write(1, "-p/s1.jsonl", b1)
+	e.run()
+
+	// Back to default with no ledger entry yet: default's file is the older
+	// one, so it takes work's responses.
+	tmp := e.path(0, "-p/.s1.tmp")
+	if err := os.WriteFile(tmp, []byte(b1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, e.path(0, "-p/s1.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	e.run()
+	if o := owners(t, e); o["m3"] != "default" {
+		t.Fatalf("setup: m3 owned by %q, want default before the ledger entry", o["m3"])
+	}
+
+	if err := e.st.RecordTransfers(context.Background(), []store.Transfer{{At: time.Now(), Mode: "copy", SessionID: "s1",
+		FromAccount: "work", ToAccount: "default", Path: e.path(0, "-p/s1.jsonl"), From: int64(len(a1)), To: int64(len(b1))}}); err != nil {
+		t.Fatal(err)
+	}
+	e.run() // default is read again; work is marked to be read again
+	e.run() // work takes its responses back
+	want := map[string]string{"m1": "default", "m2": "default", "m3": "work", "m4": "work"}
+	o := owners(t, e)
+	for k, a := range want {
+		if o[k] != a {
+			t.Fatalf("%s owned by %q, want %q (all: %v)", k, o[k], a, o)
+		}
+	}
+	// Settled: further runs read nothing again.
+	if s := e.run(); s.Parsed != 0 {
+		t.Fatalf("a settled index parsed %d files, want 0", s.Parsed)
+	}
+}
+
+// An index run that planned before a transfer was recorded must not mark
+// the file as read with the current parser: it may have counted the copied
+// bytes as the file's own.
+func TestStaleLedgerUpdateForcesReread(t *testing.T) {
+	e := newEnv(t, "default")
+	e.write(0, "-p/s1.jsonl", prompt(0, "start")+asst(1, "m1", 10))
+	e.run()
+	path := e.path(0, "-p/s1.jsonl")
+	_, mark, err := e.st.Imported()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := e.st.RecordTransfer(context.Background(), store.Transfer{At: time.Now(), Mode: "copy", SessionID: "s1",
+		FromAccount: "work", ToAccount: "default", Path: path, From: 0, To: 10})
+	if err != nil || id == 0 {
+		t.Fatalf("record: id %d, %v", id, err)
+	}
+	var fid, size int64
+	if err := e.st.DB().QueryRow("SELECT id, size FROM files WHERE path = ?", path).Scan(&fid, &size); err != nil {
+		t.Fatal(err)
+	}
+	noCost := func(string, string, transcript.Usage) (float64, bool) { return 0, false }
+	up := func(ledger int64) int64 {
+		t.Helper()
+		u := store.Update{File: store.File{ID: fid, Path: path, Account: "default", SessionID: "s1", Kind: "main", Size: size, Offset: size, Parser: ParserVersion},
+			Reset: true, Ledger: ledger}
+		if err := e.st.Apply(context.Background(), []store.Update{u}, noCost); err != nil {
+			t.Fatal(err)
+		}
+		return e.int("SELECT parser FROM files WHERE id = ?", fid)
+	}
+	if p := up(mark); p != 0 {
+		t.Fatalf("parse that predates the transfer stored parser %d, want 0", p)
+	}
+	if p := up(id); p != ParserVersion {
+		t.Fatalf("parse that knew the transfer stored parser %d, want %d", p, ParserVersion)
+	}
+	if err := e.st.DeleteTransfer(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.int("SELECT COUNT(*) FROM transfers"); n != 0 {
+		t.Fatalf("%d ledger entries left after delete", n)
+	}
+}

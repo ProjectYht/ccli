@@ -69,6 +69,9 @@ Usage:
   ccli accounts                      accounts, identity, sessions, 30-day usage, live sessions
   ccli sessions [flags]              sessions with tokens and list-price cost
   ccli show <id>                     one session: totals, models, subagents, links, files
+  ccli log <id> [turn|N-M|last]      the session turn by turn: each prompt, what it cost, what it did
+  ccli view [id]                     browse sessions, turns and agents interactively
+  ccli prompts [flags]               your prompts across sessions, sortable by cost
   ccli stats [flags]                 overview: KPIs, daily chart, projects, models, hours, shape, skills
   ccli quota [-a account]            subscription limits from the status line, and recent usage
   ccli diff <a> <b>                  sessions only in a, only in b, identical, ahead or diverged

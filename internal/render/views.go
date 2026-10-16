@@ -155,13 +155,21 @@ func (t Term) Session(d *query.SessionDetail, all bool) {
 	t.println()
 	kv := func(k, v string) { t.printf("  %-11s %s\n", t.dim(k), v) }
 	kv("project", shortHome(d.Cwd))
-	if d.GitBranch != "" {
+	switch d.GitBranch {
+	case "":
+	case "HEAD":
+		kv("branch", "detached HEAD")
+	default:
 		kv("branch", d.GitBranch)
 	}
-	kv("time", fmt.Sprintf("%s → %s  (active %s)", d.Started.In(t.Loc).Format("2006-01-02 15:04"), d.Last.In(t.Loc).Format("01-02 15:04"), Dur(d.ActiveMS)))
+	end := d.Last.In(t.Loc).Format("01-02 15:04")
+	if d.Last.In(t.Loc).Year() != d.Started.In(t.Loc).Year() {
+		end = d.Last.In(t.Loc).Format("2006-01-02 15:04")
+	}
+	kv("time", fmt.Sprintf("%s → %s  (active %s)", d.Started.In(t.Loc).Format("2006-01-02 15:04"), end, Dur(d.ActiveMS)))
 	prompts := fmt.Sprintf("%d typed", d.Prompts)
 	if d.OtherPrompts > 0 {
-		prompts += fmt.Sprintf(", %d from tasks or schedules", d.OtherPrompts)
+		prompts += fmt.Sprintf(", %d from tasks and other sessions", d.OtherPrompts)
 	}
 	kv("prompts", prompts+fmt.Sprintf(" · %d replies · %d tool calls", d.Replies, d.ToolCalls))
 	kv("tokens", fmt.Sprintf("%s in · %s out · %s cache read · %s cache write", Num(d.Tokens.Input), Num(d.Tokens.Output), Num(d.Tokens.CacheRead), Num(d.Tokens.CacheWrite)))
@@ -213,16 +221,37 @@ func (t Term) Session(d *query.SessionDetail, all bool) {
 		}
 	}
 
-	if len(d.Skills) > 0 || len(d.Tools) > 0 {
+	if len(d.Moves) > 0 {
+		t.println()
+		t.println(t.accent("Copies between accounts"))
+		for _, m := range d.Moves {
+			line := fmt.Sprintf("  %s  %s %s → %s", t.dim(m.At.In(t.Loc).Format("2006-01-02 15:04")), m.Mode, m.From, m.To)
+			if m.NewSessionID != "" {
+				line += " as " + query.ShortID(m.NewSessionID)
+			}
+			t.println(line + t.dim(fmt.Sprintf("  %s in %s", humanSize(m.Bytes), plural(m.Files, "file"))))
+		}
+	}
+
+	if len(d.Skills) > 0 || len(d.Tools) > 0 || len(d.Commands) > 0 {
 		t.println()
 		t.println(t.accent("Tools"))
-		t.printf("  %s\n", counts(d.Tools, 8))
+		if len(d.Tools) > 0 {
+			t.printf("  %s\n", counts(d.Tools, 8))
+		}
 		if len(d.Skills) > 0 {
-			t.printf("  %s %s\n", t.dim("skills"), counts(d.Skills, 8))
+			t.printf("  %s %s\n", t.dim("skills the model called"), counts(d.Skills, 8))
+		}
+		if len(d.Commands) > 0 {
+			t.printf("  %s %s\n", t.dim("commands you ran"), counts(d.Commands, 8))
 		}
 	}
 
 	t.println()
+	t.println(t.accent("Turns"))
+	t.printf("  %s\n", t.dim("ccli log "+query.ShortID(d.ID)+" lists every prompt with what it cost · ccli view "+query.ShortID(d.ID)+" browses them"))
+	t.println()
+
 	t.println(t.accent("Resume"))
 	if d.Resume.Available {
 		t.printf("  %s\n", d.Resume.Command)
@@ -252,135 +281,112 @@ func counts(cs []query.Count, n int) string {
 }
 
 // tree prints the main transcript, subagents nested by who spawned them, and
-// workflow runs with their agents.
+// workflow runs, with a line that adds the parts up to the session's cost.
 func (t Term) tree(d *query.SessionDetail, all bool) {
 	children := map[string][]query.FileInfo{} // parent agent id ("" = main) -> subagents
-	runs := map[string][]query.FileInfo{}
+	known := map[string]bool{}
 	var main *query.FileInfo
+	var subCost float64
+	subs := 0
 	for i := range d.Files {
 		f := d.Files[i]
 		switch f.Kind {
 		case "main":
 			main = &d.Files[i]
 		case "subagent":
-			children[f.Parent] = append(children[f.Parent], f)
-		case "workflow":
-			runs[f.RunID] = append(runs[f.RunID], f)
+			known[f.AgentID] = true
+			subs++
+			subCost += f.Cost
 		}
 	}
+	for _, f := range d.Files {
+		if f.Kind != "subagent" {
+			continue
+		}
+		parent := f.Parent
+		if !known[parent] {
+			parent = "" // its parent's transcript is gone: show it at the top
+		}
+		children[parent] = append(children[parent], f)
+	}
+	var runCost float64
+	for _, r := range d.Runs {
+		runCost += r.Cost
+	}
+	parts := []string{}
+	if main != nil {
+		parts = append(parts, "main "+USD(main.Cost))
+	}
+	if subs > 0 {
+		parts = append(parts, fmt.Sprintf("%s %s", plural(subs, "subagent"), USD(subCost)))
+	}
+	if len(d.Runs) > 0 {
+		parts = append(parts, fmt.Sprintf("%s %s", plural(len(d.Runs), "workflow run"), USD(runCost)))
+	}
+	if d.Cost.Unlogged > 0 {
+		parts = append(parts, "unlogged "+USD(d.Cost.Unlogged))
+	}
+	t.printf("  %s\n", t.dim(strings.Join(parts, " · ")))
+
 	limit, shown, hidden := 30, 0, 0
 	if all {
 		limit = 1 << 30
 	}
-	line := func(prefix string, f query.FileInfo, label string) {
-		if shown >= limit {
-			hidden++
-			return
-		}
-		shown++
-		usage := t.dim(fmt.Sprintf("%s tokens · %s", Num(f.Tokens.InOut()), USD(f.Cost)))
-		gone := ""
-		if f.Missing {
-			gone = t.dim(" ×")
-		}
-		t.printf("%s%s %s%s\n", prefix, label, usage, gone)
-	}
-	if main != nil {
-		line("  ", *main, t.bold("main"))
-	}
-	var walk func(parent, indent string, seen map[string]bool)
-	walk = func(parent, indent string, seen map[string]bool) {
+	var walk func(parent, indent string, depth int)
+	walk = func(parent, indent string, depth int) {
 		kids := children[parent]
 		sort.Slice(kids, func(i, j int) bool { return kids[i].Started.Before(kids[j].Started) })
 		for i, k := range kids {
-			if seen[k.AgentID] {
+			if shown >= limit {
+				hidden++
+				walk(k.AgentID, indent, depth+1)
 				continue
 			}
-			seen[k.AgentID] = true
+			shown++
 			branch, next := "├─ ", "│  "
 			if i == len(kids)-1 {
 				branch, next = "└─ ", "   "
 			}
-			name := k.AgentType
-			if name == "" {
-				name = "agent"
-			}
-			desc := ""
-			if k.Description != "" {
-				desc = " " + fit(k.Description, 48)
-			}
-			bg := ""
+			extra := ""
 			if k.Shape == "background" {
-				bg = t.dim(" (background)")
+				extra += " bg"
 			}
-			line(indent+branch, k, name+desc+bg)
-			walk(k.AgentID, indent+next, seen)
-		}
-	}
-	seen := map[string]bool{}
-	walk("", "  ", seen)
-	// Subagents whose spawning call was not found (older transcripts).
-	for parent, kids := range children {
-		if parent == "" {
-			continue
-		}
-		known := false
-		for _, f := range d.Files {
-			if f.AgentID == parent {
-				known = true
+			if k.Turn > 0 {
+				extra += fmt.Sprintf(" · turn %d", k.Turn)
 			}
-		}
-		if !known {
-			for _, k := range kids {
-				if !seen[k.AgentID] {
-					walk(parent, "  ", seen)
-				}
+			extra += fmt.Sprintf(" · %s tokens · %s", Num(k.Tokens.InOut()), USD(k.Cost))
+			if k.Missing {
+				extra += " ×"
+			}
+			label := fit(shortPaths(query.AgentLabel(k)), max(24, t.Width-len(indent)-width(extra)-6))
+			t.printf("%s%s%s%s\n", indent, t.dim(branch), label, t.dim(extra))
+			if depth < 16 {
+				walk(k.AgentID, indent+t.dim(next), depth+1)
 			}
 		}
 	}
+	walk("", "  ", 0)
 	if hidden > 0 {
 		t.printf("  %s\n", t.dim(fmt.Sprintf("… %d more agents (ccli show --all %s)", hidden, query.ShortID(d.ID))))
 	}
-	ids := make([]string, 0, len(runs))
-	started := map[string]time.Time{}
-	for id, fs := range runs {
-		ids = append(ids, id)
-		for _, f := range fs {
-			if s := started[id]; !f.Started.IsZero() && (s.IsZero() || f.Started.Before(s)) {
-				started[id] = f.Started
-			}
-		}
-	}
-	sort.Slice(ids, func(i, j int) bool { return started[ids[i]].Before(started[ids[j]]) })
 	shownRuns := 0
-	info := map[string]query.RunInfo{}
 	for _, r := range d.Runs {
-		info[r.ID] = r
-	}
-	for _, id := range ids {
-		r := info[id]
-		var tok int64
-		var cost float64
-		for _, f := range runs[id] {
-			tok += f.Tokens.InOut()
-			cost += f.Cost
-		}
-		status := fmt.Sprintf("%d agents, %d done", len(runs[id]), r.Results)
-		if r.Failed > 0 {
-			status += t.warn(fmt.Sprintf(", %d failed", r.Failed))
-		}
 		if shownRuns >= limit {
-			continue
+			break
 		}
 		shownRuns++
-		name := id
-		if len(name) > 11 {
-			name = name[:11]
+		when := ""
+		if !r.At.IsZero() {
+			when = r.At.In(t.Loc).Format("01-02 15:04") + " "
 		}
-		t.printf("  workflow %s %s  %s %s\n", name, t.dim(started[id].In(t.Loc).Format("01-02 15:04")), status, t.dim(fmt.Sprintf("· %s tokens · %s", Num(tok), USD(cost))))
+		turn := ""
+		if r.Turn > 0 {
+			turn = fmt.Sprintf(" · turn %d", r.Turn)
+		}
+		t.printf("  %s%s\n", t.dim(when), runLine(t, r)+t.dim(turn))
 	}
-	if len(ids) > shownRuns {
-		t.printf("  %s\n", t.dim(fmt.Sprintf("… %d more workflow runs (ccli show --all %s)", len(ids)-shownRuns, query.ShortID(d.ID))))
+	if len(d.Runs) > shownRuns {
+		t.printf("  %s\n", t.dim(fmt.Sprintf("… %d more workflow runs (ccli show --all %s)", len(d.Runs)-shownRuns, query.ShortID(d.ID))))
 	}
 }
 
@@ -729,3 +735,6 @@ func plural(n int, word string) string {
 	}
 	return fmt.Sprintf("%d %ss", n, word)
 }
+
+// Plural writes a count with its noun: "1 agent", "3 agents".
+func Plural(n int, word string) string { return plural(n, word) }

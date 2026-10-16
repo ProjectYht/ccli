@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Renders the README screenshots from a synthetic home (scripts/demo), so no
-# real session data ends up in them. Needs go, jq and freeze
+# real session data ends up in them. Needs go, jq, tmux and freeze
 # (go install github.com/charmbracelet/freeze@latest); ImageMagick, if
 # present, shrinks the images.
 #
@@ -11,7 +11,8 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 out="$repo/docs/images"
 work="$(mktemp -d)"
 live=""
-trap '[ -n "$live" ] && kill "$live" 2>/dev/null; rm -rf "$work"' EXIT
+sock="ccli-shots-$$"
+trap '[ -n "$live" ] && kill "$live" 2>/dev/null; tmux -L "$sock" kill-server 2>/dev/null; rm -rf "$work"' EXIT
 
 home="$work/home"
 mkdir -p "$out"
@@ -22,9 +23,9 @@ sleep 600 &
 live=$!
 go run "$repo/scripts/demo" -home "$home" -live-pid "$live" >/dev/null
 
+env_vars=(HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" XDG_STATE_HOME="$home/.local/state")
 ccli() {
-	HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" \
-		XDG_STATE_HOME="$home/.local/state" COLUMNS="${COLS:-112}" "$work/ccli" "$@"
+	env "${env_vars[@]}" COLUMNS="${COLS:-112}" "$work/ccli" "$@"
 }
 ccli index >/dev/null
 
@@ -36,17 +37,14 @@ snap() { # snap <config dir> <5h %> <5h reset> <7d %> <7d reset>
 	printf '{"session_id":"demo","transcript_path":"%s","model":{"id":"claude-opus-5-5"},"rate_limits":{"five_hour":{"used_percentage":%s,"resets_at":%s},"seven_day":{"used_percentage":%s,"resets_at":%s}}}' \
 		"$tp" "$2" "$3" "$4" "$5" | ccli statusline -- cat >/dev/null
 }
-snap "$home/.claude" 31 $((now + 7800)) 58 $((now + 302400))
-snap "$home/.claude-work" 74 $((now + 3000)) 41 $((now + 190000))
+snap "$home/.claude" 31.5 $((now + 7800)) 58 $((now + 302400))
+snap "$home/.claude-work" 74 $((now + 3000)) 41.2 $((now + 190000))
 
 lead=$(ccli sessions --json -n 200 | jq -r '.sessions[] | select(.title == "Audit payment retries across services") | .id')
 ahead=$(ccli diff default work --json | jq -r '[.[] | select(.state | test("ahead"))][0].session_id')
 
-shot() { # shot <name> <ccli args...>
+finish() { # finish <name>: render $work/<name>.ansi into docs/images/<name>.png
 	local name=$1
-	shift
-	# The fake home lives in a temp dir; show it as a plain home path.
-	ccli "$@" --color always | sed "s#$home#/Users/alex#g" >"$work/$name.ansi"
 	freeze "$work/$name.ansi" --language ansi --window --output "$out/$name.png" \
 		--padding 24,32 --margin 0 --border.radius 10 --font.size 14 --line-height 1.3 \
 		--background "#16161e" >/dev/null
@@ -57,10 +55,36 @@ shot() { # shot <name> <ccli args...>
 	echo "$out/$name.png"
 }
 
+shot() { # shot <name> <ccli args...>
+	local name=$1
+	shift
+	# The fake home lives in a temp dir; show it as a plain home path.
+	# Piped output never pages.
+	ccli "$@" --color always | sed "s#$home#/Users/alex#g" >"$work/$name.ansi"
+	finish "$name"
+}
+
 shot stats stats
 COLS=136 shot sessions sessions -n 16
 shot show show "${lead:0:8}"
+COLS=120 shot log log "${lead:0:8}"
+COLS=100 shot turn log "${lead:0:8}" 1
+COLS=124 shot prompts prompts --sort cost -n 14
 shot accounts accounts
 shot quota quota
 shot diff diff default work --project web-dashboard --all
 shot copy copy "${ahead:0:8}" --from work --to default
+
+# The interactive browser, driven in a private tmux server.
+tmux -L "$sock" -f /dev/null new-session -d -s v -x 150 -y 38 \
+	"env ${env_vars[*]} TERM=xterm-256color $work/ccli view ${lead:0:8}; sleep 60"
+sleep 2
+tmux -L "$sock" send-keys -t v g
+sleep 1
+tmux -L "$sock" send-keys -t v j j
+sleep 1.5
+# tmux writes "default colour" as SGR 39 and 49, which freeze ignores; a plain
+# reset draws the same. Padding at line ends is dropped.
+tmux -L "$sock" capture-pane -t v -p -e | sed "s#$home#/Users/alex#g" |
+	perl -pe 's/\e\[(?:39|49)m/\e[0m/g; s/ +((?:\e\[[0-9;]*m)*)$/$1/' >"$work/view.ansi"
+finish view

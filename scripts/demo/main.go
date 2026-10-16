@@ -162,8 +162,8 @@ func (g *gen) run(livePID int) error {
 	// transcript never recorded, plus the running one.
 	lead := g.session(projects[0], 0)
 	lead.start = g.now.Add(-7 * time.Hour)
-	lead.title, lead.turns, lead.subs, lead.nested, lead.workflow = "Audit payment retries across services", 46, 3, true, true
-	lead.skill, lead.shortfall = "code-review", 0.07
+	lead.title, lead.turns, lead.subs = "Audit payment retries across services", 46, 1
+	lead.script, lead.shortfall = leadScript, 0.07
 	add(lead)
 	for i, name := range []string{"researcher-1", "researcher-2", "reviewer"} {
 		t := g.session(projects[0], 0)
@@ -230,6 +230,7 @@ type session struct {
 	skill, team, agent          string
 	continued                   string
 	shortfall                   float64
+	script                      []turnScript // played before the generic turns
 }
 
 func (g *gen) session(p project, daysAgo int) *session {
@@ -265,98 +266,68 @@ func (t totals) add(model string, in, out, read, write int64) {
 }
 
 // write writes a session's main transcript and its subagents, and returns the
-// main transcript's path.
+// main transcript's path. A session with a script plays it first; the rest
+// of its turns are generic.
 func (g *gen) write(s *session) string {
 	base := filepath.Join(g.dir(s.acct), "projects", key(s.cwd))
 	path := filepath.Join(base, s.id+".jsonl")
-	var b strings.Builder
-	sum := totals{}
-	t := s.start
-	ctx := int64(18_000 + g.rng.IntN(8_000))
-	common := func(m map[string]any) map[string]any {
-		m["sessionId"], m["cwd"], m["timestamp"] = s.id, s.cwd, ts(t)
-		if s.team != "" {
-			m["teamName"], m["agentName"] = s.team, s.agent
-		}
-		return m
-	}
+	w := &writer{g: g, s: s, base: base, t: s.start, sum: totals{}, ctx: int64(18_000 + g.rng.IntN(8_000))}
 	if s.title != "" && s.team == "" {
-		b.WriteString(g.line(map[string]any{"type": "ai-title", "aiTitle": s.title, "sessionId": s.id}))
+		w.b.WriteString(g.line(map[string]any{"type": "ai-title", "aiTitle": s.title, "sessionId": s.id}))
 	}
 	spawnAt := map[int]bool{}
 	for i := 0; i < s.subs; i++ {
-		spawnAt[1+g.rng.IntN(max(1, s.turns-1))] = true
+		spawnAt[len(s.script)+1+g.rng.IntN(max(1, s.turns-len(s.script)-1))] = true
 	}
 	subN, wfDone := 0, false
 	for turn := 0; turn < s.turns; turn++ {
-		if t.After(g.now.Add(-3 * time.Minute)) {
+		if w.t.After(g.now.Add(-3 * time.Minute)) {
 			break // sessions from today stop before now
+		}
+		if turn < len(s.script) {
+			w.scripted(s.script[turn])
+			w.pause()
+			continue
 		}
 		text := prompts[g.rng.IntN(len(prompts))]
 		if turn == 0 && s.title == "" && s.team == "" {
 			text = "Why does the nightly export take forty minutes now?"
 		}
-		src := "typed"
+		origin := "human"
 		if s.team != "" {
-			src = "teammate"
+			origin = "peer"
 		}
-		b.WriteString(g.line(common(map[string]any{"type": "user", "promptSource": src,
-			"message": map[string]any{"role": "user", "content": text}})))
+		w.prompt(text, origin)
 		for r, n := 0, 1+g.rng.IntN(5); r < n; r++ {
-			t = t.Add(time.Duration(4+g.rng.IntN(40)) * time.Second)
-			tool, input := g.tool()
-			id := g.toolID()
+			w.t = w.t.Add(time.Duration(4+g.rng.IntN(40)) * time.Second)
+			name, input := g.tool()
+			c := call{name: name, input: input, out: "ok"}
 			if spawnAt[turn] && r == 0 && subN < s.subs {
 				st := subagentTypes[g.spawns%len(subagentTypes)]
 				g.spawns++
-				tool, input = "Agent", map[string]any{"description": st.desc, "subagent_type": st.kind}
-				g.subagent(s, base, id, st.kind, st.desc, st.model, t, 1, s.nested && subN == 0, sum)
+				c = call{name: "Agent", input: map[string]any{"description": st.desc, "subagent_type": st.kind,
+					"prompt": st.desc + ". Report what you find; do not change any files."},
+					agent: &agentSpec{kind: st.kind, desc: st.desc, model: st.model, nest: s.nested && subN == 0}}
 				subN++
 			}
 			if s.skill != "" && turn == 1 && r == 0 {
-				tool, input = "Skill", map[string]any{"skill": s.skill}
+				c = call{name: "Skill", input: map[string]any{"skill": s.skill}, out: "Launching skill: " + s.skill}
 			}
-			write := int64(600 + g.rng.IntN(3_400))
-			out := int64(150 + g.rng.IntN(2_200))
-			in := int64(1 + g.rng.IntN(12))
-			usage := map[string]any{"input_tokens": in, "output_tokens": out, "cache_read_input_tokens": ctx,
-				"cache_creation_input_tokens": write,
-				"cache_creation":              map[string]any{"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": write}}
-			if g.rng.IntN(40) == 0 {
-				usage["server_tool_use"] = map[string]any{"web_search_requests": 2}
-			}
-			sum.add(s.model, in, out, ctx, write)
-			msg := map[string]any{"id": g.msgID(), "model": s.model, "role": "assistant", "usage": usage,
-				"content": []any{
-					map[string]any{"type": "text", "text": "Checking."},
-					map[string]any{"type": "tool_use", "id": id, "name": tool, "input": input},
-				}}
-			b.WriteString(g.line(common(map[string]any{"type": "assistant", "requestId": "req_" + g.hex(20), "message": msg})))
-			t = t.Add(time.Duration(2+g.rng.IntN(20)) * time.Second)
-			b.WriteString(g.line(common(map[string]any{"type": "user", "message": map[string]any{"role": "user",
-				"content": []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": "ok"}}}})))
-			ctx += write
+			w.assistant("Checking.", c)
 		}
 		if s.workflow && !wfDone && turn == s.turns/2 {
-			g.workflow(s, base, t, sum)
+			w.assistant("Running the checks as a workflow.", call{name: "Workflow", workflow: &workflowSpec{name: "nightly-checks",
+				summary: "Run the three nightly checks in parallel", jobs: [][2]string{{"Scan", "scan:a"}, {"Scan", "scan:b"}, {"Report", "summarize"}}}})
 			wfDone = true
 		}
-		// The person reads and types; now and then they leave for a while.
-		gap := time.Duration(20+g.rng.IntN(200)) * time.Second
-		if g.rng.IntN(9) == 0 {
-			gap = time.Duration(12+g.rng.IntN(40)) * time.Minute
-		}
-		t = t.Add(gap)
-		if ctx > 380_000 {
-			ctx = 40_000 // compacted
-		}
+		w.pause()
 	}
 	if s.continued != "" {
-		b.WriteString(g.line(map[string]any{"type": "continued-in", "continuedInSessionId": s.continued, "sessionId": s.id}))
+		w.b.WriteString(g.line(map[string]any{"type": "continued-in", "continuedInSessionId": s.continued, "sessionId": s.id}))
 	}
 	if s.shortfall > 0 {
 		usage, cost := map[string]any{}, 0.0
-		for m, v := range sum {
+		for m, v := range w.sum {
 			f := 1.0
 			if m == s.model {
 				f += s.shortfall
@@ -367,38 +338,205 @@ func (g *gen) write(s *session) string {
 				"webSearchRequests": 0, "costUSD": c}
 			cost += c
 		}
-		b.WriteString(g.line(map[string]any{"type": "cost-state", "sessionId": s.id, "totalCostUSD": cost,
+		w.b.WriteString(g.line(map[string]any{"type": "cost-state", "sessionId": s.id, "totalCostUSD": cost,
 			"startTime": s.start.UnixMilli(), "modelUsage": usage}))
 	}
 	g.must(os.MkdirAll(base, 0o755))
-	g.must(os.WriteFile(path, []byte(b.String()), 0o644))
+	g.must(os.WriteFile(path, []byte(w.b.String()), 0o644))
 	return path
 }
 
-// subagent writes one subagent transcript and its meta file. A nested one
-// spawns a further agent of its own.
-func (g *gen) subagent(s *session, base, toolUse, kind, desc, model string, t time.Time, depth int, nest bool, sum totals) {
+// turnScript is one scripted turn: a prompt, the model's opening text, its
+// tool calls, and its closing reply.
+type turnScript struct {
+	prompt, origin string
+	open           string
+	calls          []call
+	reply          string
+}
+
+type call struct {
+	name     string
+	input    map[string]any
+	out      string
+	isErr    bool
+	agent    *agentSpec
+	workflow *workflowSpec
+}
+
+type agentSpec struct {
+	kind, desc, model string
+	nest              bool
+}
+
+type workflowSpec struct {
+	name, summary string
+	jobs          [][2]string // phase, label
+	failed        int         // index of a job that fails, or -1 when none
+}
+
+// writer builds one main transcript.
+type writer struct {
+	g    *gen
+	s    *session
+	base string
+	b    strings.Builder
+	t    time.Time
+	sum  totals
+	ctx  int64
+	n    int // prompts written, for promptIds
+}
+
+func (w *writer) common(m map[string]any) map[string]any {
+	m["sessionId"], m["cwd"], m["timestamp"] = w.s.id, w.s.cwd, ts(w.t)
+	if w.s.team != "" {
+		m["teamName"], m["agentName"] = w.s.team, w.s.agent
+	}
+	return m
+}
+
+func (w *writer) prompt(text, origin string) {
+	w.n++
+	src := "typed"
+	if origin != "human" {
+		src = "system"
+	}
+	w.b.WriteString(w.g.line(w.common(map[string]any{"type": "user", "promptSource": src, "origin": map[string]any{"kind": origin},
+		"promptId": fmt.Sprintf("%s-p%d", w.s.id[:8], w.n), "message": map[string]any{"role": "user", "content": text}})))
+}
+
+// usage makes the usage of one model call and adds it to the totals.
+func (w *writer) usage() map[string]any {
+	g := w.g
+	write := int64(600 + g.rng.IntN(3_400))
+	out := int64(150 + g.rng.IntN(2_200))
+	in := int64(1 + g.rng.IntN(12))
+	u := map[string]any{"input_tokens": in, "output_tokens": out, "cache_read_input_tokens": w.ctx,
+		"cache_creation_input_tokens": write,
+		"cache_creation":              map[string]any{"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": write}}
+	if g.rng.IntN(40) == 0 {
+		u["server_tool_use"] = map[string]any{"web_search_requests": 2}
+	}
+	w.sum.add(w.s.model, in, out, w.ctx, write)
+	w.ctx += write
+	if w.ctx > 380_000 {
+		w.ctx = 40_000 // compacted
+	}
+	return u
+}
+
+// assistant writes one model response: text, then a tool call and its result.
+func (w *writer) assistant(text string, c call) {
+	g := w.g
+	content := []any{}
+	if text != "" {
+		content = append(content, map[string]any{"type": "text", "text": text})
+	}
+	id := g.toolID()
+	input := c.input
+	if c.workflow != nil {
+		input = map[string]any{"script": "export const meta = {\n  name: '" + c.workflow.name + "',\n  description: '" + c.workflow.summary + "',\n}\n"}
+	}
+	if c.name != "" {
+		content = append(content, map[string]any{"type": "tool_use", "id": id, "name": c.name, "input": input})
+	}
+	msg := map[string]any{"id": g.msgID(), "model": w.s.model, "role": "assistant", "usage": w.usage(), "content": content}
+	w.b.WriteString(g.line(w.common(map[string]any{"type": "assistant", "requestId": "req_" + g.hex(20), "message": msg})))
+	if c.name == "" {
+		return
+	}
+	w.t = w.t.Add(time.Duration(2+g.rng.IntN(20)) * time.Second)
+	res := map[string]any{"type": "tool_result", "tool_use_id": id, "content": c.out}
+	if c.isErr {
+		res["is_error"] = true
+	}
+	line := w.common(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": []any{res}}})
+	switch {
+	case c.agent != nil:
+		prompt, _ := c.input["prompt"].(string)
+		aid := g.subagent(w.s, w.base, id, c.agent.kind, c.agent.desc, prompt, c.agent.model, w.t, 1, c.agent.nest, w.sum)
+		line["toolUseResult"] = map[string]any{"status": "async_launched", "agentId": aid, "description": c.agent.desc}
+		res["content"] = "Async agent launched successfully."
+	case c.workflow != nil:
+		run := g.workflow(w.s, w.base, w.t, w.sum, c.workflow)
+		line["toolUseResult"] = map[string]any{"status": "async_launched", "runId": run, "workflowName": c.workflow.name, "summary": c.workflow.summary}
+		res["content"] = "Workflow launched in background."
+	}
+	w.b.WriteString(g.line(line))
+}
+
+func (w *writer) scripted(ts turnScript) {
+	origin := ts.origin
+	if origin == "" {
+		origin = "human"
+	}
+	w.prompt(ts.prompt, origin)
+	w.t = w.t.Add(time.Duration(5+w.g.rng.IntN(20)) * time.Second)
+	if ts.open != "" && len(ts.calls) == 0 {
+		w.assistant(ts.open, call{})
+	}
+	for i, c := range ts.calls {
+		text := ""
+		if i == 0 {
+			text = ts.open
+		}
+		if c.out == "" {
+			c.out = "ok"
+		}
+		w.assistant(text, c)
+		w.t = w.t.Add(time.Duration(6+w.g.rng.IntN(40)) * time.Second)
+	}
+	if ts.reply != "" {
+		w.assistant(ts.reply, call{})
+	}
+}
+
+// pause is the person reading and typing; now and then they leave for a while.
+func (w *writer) pause() {
+	gap := time.Duration(20+w.g.rng.IntN(200)) * time.Second
+	if w.g.rng.IntN(9) == 0 {
+		gap = time.Duration(12+w.g.rng.IntN(40)) * time.Minute
+	}
+	w.t = w.t.Add(gap)
+}
+
+// subagent writes one subagent transcript and its meta file, and returns its
+// agent id. A nested one spawns a further agent of its own.
+func (g *gen) subagent(s *session, base, toolUse, kind, desc, prompt, model string, t time.Time, depth int, nest bool, sum totals) string {
 	aid := g.hex(17)
 	dir := filepath.Join(base, s.id, "subagents")
 	var b strings.Builder
+	if prompt == "" {
+		prompt = desc + "."
+	}
+	b.WriteString(g.line(map[string]any{"type": "user", "isSidechain": true, "agentId": aid, "sessionId": s.id, "cwd": s.cwd,
+		"timestamp": ts(t), "message": map[string]any{"role": "user", "content": prompt}}))
 	ctx := int64(9_000)
 	for r, n := 0, 4+g.rng.IntN(9); r < n; r++ {
 		t = t.Add(time.Duration(3+g.rng.IntN(15)) * time.Second)
 		tool, input := g.tool()
 		id := g.toolID()
 		if nest && r == 1 {
-			tool, input = "Agent", map[string]any{"description": "Check the retry docs", "subagent_type": "Explore"}
-			g.subagent(s, base, id, "Explore", "Check the retry docs", "claude-haiku-4-5-20251001", t, depth+1, false, sum)
+			tool, input = "Agent", map[string]any{"description": "Check the retry docs", "subagent_type": "Explore", "prompt": "Read docs/retries.md and list every rule it states."}
+			g.subagent(s, base, id, "Explore", "Check the retry docs", "Read docs/retries.md and list every rule it states.", "claude-haiku-4-5-20251001", t, depth+1, false, sum)
 		}
 		write, out := int64(400+g.rng.IntN(2_000)), int64(100+g.rng.IntN(1_200))
 		sum.add(model, 2, out, ctx, write)
-		b.WriteString(g.line(map[string]any{"type": "assistant", "isSidechain": true, "sessionId": s.id, "cwd": s.cwd,
+		content := []any{map[string]any{"type": "tool_use", "id": id, "name": tool, "input": input}}
+		if r == n-1 {
+			content = []any{map[string]any{"type": "text", "text": "Done: three call sites retry without a key; the other two pass the order's key through."}}
+		}
+		b.WriteString(g.line(map[string]any{"type": "assistant", "isSidechain": true, "agentId": aid, "sessionId": s.id, "cwd": s.cwd,
 			"timestamp": ts(t), "requestId": "req_" + g.hex(20),
 			"message": map[string]any{"id": g.msgID(), "model": model, "role": "assistant",
 				"usage": map[string]any{"input_tokens": 2, "output_tokens": out, "cache_read_input_tokens": ctx,
 					"cache_creation_input_tokens": write,
 					"cache_creation":              map[string]any{"ephemeral_5m_input_tokens": write, "ephemeral_1h_input_tokens": 0}},
-				"content": []any{map[string]any{"type": "tool_use", "id": id, "name": tool, "input": input}}}}))
+				"content": content}}))
+		if r < n-1 {
+			b.WriteString(g.line(map[string]any{"type": "user", "isSidechain": true, "agentId": aid, "sessionId": s.id, "timestamp": ts(t),
+				"message": map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": "ok"}}}}))
+		}
 		ctx += write
 	}
 	g.must(os.MkdirAll(dir, 0o755))
@@ -406,39 +544,59 @@ func (g *gen) subagent(s *session, base, toolUse, kind, desc, model string, t ti
 	g.must(g.writeJSON(filepath.Join(dir, "agent-"+aid+".meta.json"), map[string]any{
 		"agentType": kind, "description": desc, "toolUseId": toolUse, "spawnDepth": depth, "requestShape": "background",
 	}))
+	return aid
 }
 
-// workflow writes a three-agent workflow run with its journal.
-func (g *gen) workflow(s *session, base string, t time.Time, sum totals) {
-	run := "wf_" + g.hex(12)
+// workflow writes a workflow run: its agents, journal and state file. It
+// returns the run id.
+func (g *gen) workflow(s *session, base string, t time.Time, sum totals, spec *workflowSpec) string {
+	run := "wf_" + g.hex(8) + "-" + g.hex(3)
 	dir := filepath.Join(base, s.id, "subagents", "workflows", run)
 	g.must(os.MkdirAll(dir, 0o755))
+	start := t
 	var journal strings.Builder
-	for i := 0; i < 3; i++ {
-		journal.WriteString(`{"type":"launched"}` + "\n")
+	journal.WriteString(`{"type":"launched"}` + "\n")
+	failed := spec.failed
+	if len(spec.jobs) < 3 {
+		failed = -1
 	}
-	for i, job := range []string{"Scan service A for retry loops", "Scan service B for retry loops", "Summarise the findings"} {
-		journal.WriteString(`{"type":"started"}` + "\n")
+	for i, job := range spec.jobs {
+		aid := g.hex(17)
+		fmt.Fprintf(&journal, `{"type":"started","agentId":%q,"label":%q,"phase":%q}`+"\n", aid, job[1], job[0])
 		var b strings.Builder
+		b.WriteString(g.line(map[string]any{"type": "user", "isSidechain": true, "agentId": aid, "sessionId": s.id, "cwd": s.cwd,
+			"timestamp": ts(t), "message": map[string]any{"role": "user", "content": "Workflow task " + job[1] + ": " + spec.summary + ". Return a short structured report."}}))
 		ctx := int64(7_000)
-		for r := 0; r < 5+i; r++ {
+		n := 5 + i
+		if i == failed {
+			n = 2
+		}
+		for r := 0; r < n; r++ {
 			t = t.Add(time.Duration(5+g.rng.IntN(20)) * time.Second)
 			write, out := int64(500+g.rng.IntN(1_500)), int64(200+g.rng.IntN(900))
 			sum.add("claude-sonnet-5", 3, out, ctx, write)
-			b.WriteString(g.line(map[string]any{"type": "assistant", "isSidechain": true, "sessionId": s.id, "cwd": s.cwd,
-				"timestamp": ts(t), "message": map[string]any{"id": g.msgID(), "model": "claude-sonnet-5", "role": "assistant",
+			b.WriteString(g.line(map[string]any{"type": "assistant", "isSidechain": true, "agentId": aid, "attributionAgent": "workflow-subagent",
+				"sessionId": s.id, "cwd": s.cwd, "timestamp": ts(t), "message": map[string]any{"id": g.msgID(), "model": "claude-sonnet-5", "role": "assistant",
 					"usage":   map[string]any{"input_tokens": 3, "output_tokens": out, "cache_read_input_tokens": ctx, "cache_creation_input_tokens": write},
-					"content": []any{map[string]any{"type": "text", "text": "Done."}}}}))
+					"content": []any{map[string]any{"type": "text", "text": "Checked " + job[1] + "."}}}}))
 			ctx += write
 		}
-		aid := g.hex(17)
 		g.must(os.WriteFile(filepath.Join(dir, "agent-"+aid+".jsonl"), []byte(b.String()), 0o644))
 		g.must(g.writeJSON(filepath.Join(dir, "agent-"+aid+".meta.json"), map[string]any{
-			"agentType": "workflow", "description": job, "spawnDepth": 1,
+			"agentType": "general-purpose", "description": job[1], "workflowPhase": job[0], "spawnDepth": 1, "requestShape": "foreground",
 		}))
-		journal.WriteString(`{"type":"result"}` + "\n")
+		if i == failed {
+			fmt.Fprintf(&journal, `{"type":"failed","agentId":%q}`+"\n", aid)
+		} else {
+			fmt.Fprintf(&journal, `{"type":"result","agentId":%q,"result":"{}"}`+"\n", aid)
+		}
 	}
 	g.must(os.WriteFile(filepath.Join(dir, "journal.jsonl"), []byte(journal.String()), 0o644))
+	g.must(g.writeJSON(filepath.Join(base, s.id, "workflows", run+".json"), map[string]any{
+		"runId": run, "workflowName": spec.name, "status": "completed", "summary": spec.summary,
+		"startTime": start.UnixMilli(), "durationMs": t.Sub(start).Milliseconds(), "agentCount": len(spec.jobs),
+	}))
+	return run
 }
 
 func (g *gen) tool() (string, map[string]any) {
@@ -511,4 +669,78 @@ func (g *gen) must(err error) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// leadScript is the opening of the demo's longest session: realistic enough
+// to show what ccli log and ccli view render.
+var leadScript = []turnScript{
+	{
+		prompt: "Audit how our services retry failed payment calls. I want to know where a retry can **charge a customer twice**.\n\nStart with `checkout-service`, then look at `billing-worker` and `refund-api`.",
+		open:   "I'll map every retry path first, then check each one for an idempotency key.",
+		calls: []call{
+			{name: "Grep", input: map[string]any{"pattern": "retry|backoff", "path": "src"}, out: "src/payments/client.go\nsrc/payments/retry.go\nsrc/orders/export.go"},
+			{name: "Read", input: map[string]any{"file_path": "src/payments/client.go"}},
+			{name: "Agent", input: map[string]any{"description": "Find every caller of the retry helper", "subagent_type": "Explore",
+				"prompt": "Find every caller of `retry.Do` in src/ and say, for each, whether the request it repeats carries an idempotency key. Read only; report file:line."},
+				agent: &agentSpec{kind: "Explore", desc: "Find every caller of the retry helper", model: "claude-haiku-4-5-20251001", nest: true}},
+			{name: "Read", input: map[string]any{"file_path": "src/payments/retry.go", "offset": 40}},
+		},
+		reply: "## What I found\n\n- `chargeCard` retries up to **3 times** on any 5xx or timeout.\n- Each attempt builds a new request, so the idempotency key is **regenerated** on retry.\n- `billing-worker` passes the order's key through; `refund-api` never retries.\n\n| Service | Retries | Key reused on retry |\n|---|---|---|\n| checkout-service | 3 | no |\n| billing-worker | 5 | yes |\n| refund-api | 0 | n/a |\n\nA double charge happens when the first attempt times out on our side after the provider has already accepted it.",
+	},
+	{
+		prompt: "Here is the incident log from last Tuesday:\n\n<pasted_content id=\"a1\">\n2026-10-07T14:02:11Z WARN  charge timeout after 10s order=88412\n2026-10-07T14:02:11Z INFO  retrying charge attempt=2 order=88412\n2026-10-07T14:02:13Z INFO  charge ok id=ch_9f2 order=88412\n2026-10-07T14:02:40Z ERROR provider webhook: duplicate charge ch_9e7 order=88412\n</pasted_content id=\"a1\">\n\nDoes this match what you found?",
+		open:   "Checking where the key is set.",
+		calls: []call{
+			{name: "Bash", input: map[string]any{"command": "rg -n 'IdempotencyKey' src/", "description": "Find where the key is set"}, out: "src/payments/client.go:118:\treq.IdempotencyKey = uuid.NewString()"},
+			{name: "Read", input: map[string]any{"file_path": "src/payments/client.go", "offset": 110}},
+		},
+		reply: "Yes. Attempt 1 (`ch_9e7`) succeeded at the provider but timed out on our side. Attempt 2 got a **new key** at `client.go:118`, so the provider treated it as a new charge (`ch_9f2`). The webhook flagged the duplicate 27 seconds later.",
+	},
+	{
+		prompt: "Fix it: generate the key once per order and reuse it on every attempt. Add a test that simulates the timeout.",
+		open:   "Moving the key out of the attempt loop.",
+		calls: []call{
+			{name: "Edit", input: map[string]any{"file_path": "src/payments/client.go", "old_string": "req.IdempotencyKey = uuid.NewString()", "new_string": "req.IdempotencyKey = order.IdempotencyKey()"}},
+			{name: "Edit", input: map[string]any{"file_path": "src/payments/retry.go", "old_string": "for attempt := 1;", "new_string": "key := order.IdempotencyKey()\n\tfor attempt := 1;"}},
+			{name: "Write", input: map[string]any{"file_path": "src/payments/retry_test.go", "content": "func TestRetryReusesKey(t *testing.T) { … }"}},
+			{name: "Bash", input: map[string]any{"command": "go test ./src/payments/...", "description": "Run the payment tests"}, out: "--- FAIL: TestRetryReusesKey (0.01s)\n    retry_test.go:31: second attempt sent key \"\"", isErr: true},
+			{name: "Edit", input: map[string]any{"file_path": "src/payments/retry.go", "old_string": "c.charge(ctx, req)", "new_string": "c.charge(ctx, req.WithKey(key))"}},
+			{name: "Bash", input: map[string]any{"command": "go test ./src/payments/...", "description": "Run the payment tests"}, out: "ok  \tacme/checkout/src/payments\t0.412s"},
+		},
+		reply: "Done. The key is now created once per order:\n\n```go\nkey := order.IdempotencyKey()\nfor attempt := 1; attempt <= maxAttempts; attempt++ {\n\tres, err := c.charge(ctx, req.WithKey(key))\n\tif err == nil || !retryable(err) {\n\t\treturn res, err\n\t}\n}\n```\n\n`TestRetryReusesKey` makes the first attempt time out after the fake provider accepts it, and checks that the second attempt sends the same key.",
+	},
+	{
+		prompt: "<command-message>code-review</command-message>\n<command-name>/code-review</command-name>\n<command-args>src/payments</command-args>",
+		open:   "Starting a review of the change.",
+		calls: []call{
+			{name: "Agent", input: map[string]any{"description": "Review the retry fix for double charges", "subagent_type": "code-reviewer",
+				"prompt": "Review the diff in src/payments for anything that could still charge twice, leak the idempotency key, or change behaviour for callers. Rank findings by severity."},
+				agent: &agentSpec{kind: "code-reviewer", desc: "Review the retry fix for double charges", model: "claude-sonnet-5"}},
+		},
+		reply: "The reviewer is running in the background; I'll report when it finishes.",
+	},
+	{
+		prompt: "<task-notification>\n<task-id>b7k2</task-id>\n<status>completed</status>\n<summary>Agent \"Review the retry fix for double charges\" completed</summary>\n<result>One medium finding: the key is logged at INFO level in client.go:131, which puts it in the shared log index.</result>\n</task-notification>",
+		origin: "task-notification",
+		open:   "The review found one medium issue: the key is logged at INFO level in `client.go:131`. Everything else checks out.",
+	},
+	{
+		prompt: "Good catch. Lower that log to DEBUG, then run the same audit across the other two services in parallel.",
+		open:   "Lowering the log level, then auditing the other services as a workflow.",
+		calls: []call{
+			{name: "Edit", input: map[string]any{"file_path": "src/payments/client.go", "old_string": "log.Info(\"charging\"", "new_string": "log.Debug(\"charging\""}},
+			{name: "Workflow", workflow: &workflowSpec{name: "retry-audit", summary: "Audit billing-worker and refund-api for retries that can repeat a charge",
+				jobs: [][2]string{{"Audit", "audit:billing-worker"}, {"Audit", "audit:refund-api"}, {"Report", "summarize"}}, failed: -1}},
+		},
+		reply: "The workflow is running: one agent per service, then a summary.",
+	},
+	{
+		prompt: "<task-notification>\n<task-id>wv3x</task-id>\n<status>completed</status>\n<summary>Workflow \"retry-audit\" completed</summary>\n<result>billing-worker reuses the order key on all 5 attempts. refund-api never retries. No other double-charge path.</result>\n</task-notification>",
+		origin: "task-notification",
+		open:   "The audit is complete: `billing-worker` already reuses the order key, and `refund-api` never retries. The checkout fix closes the only double-charge path.",
+	},
+	{
+		prompt: "Write the summary for the incident review. Keep it short.",
+		reply:  "### Incident 88412: duplicate charge\n\n**Cause.** `checkout-service` retried a timed-out charge with a new idempotency key, so the provider accepted both attempts.\n\n**Fix.** The key is now created once per order and reused on every attempt (`src/payments/retry.go`), with a test that reproduces the timeout.\n\n**Scope.** `billing-worker` and `refund-api` were audited; neither can repeat a charge.\n\n**Follow-up.** The key is no longer logged at INFO level.",
+	},
 }

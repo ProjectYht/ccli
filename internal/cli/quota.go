@@ -41,14 +41,33 @@ func cmdQuota(ctx context.Context, a *app, args []string) error {
 			continue
 		}
 		r := render.QuotaRow{Account: ac.Name, Email: ac.Email}
+		var status, cc *quota.Snapshot
 		if s, ok := snaps[ac.Name]; ok {
-			r.Snapshot = &s
+			status = &s
 		}
-		if r.Last5h, r.Cost5h, err = svc.Usage(ctx, ac.Name, now.Add(-5*time.Hour)); err != nil {
-			return err
+		if s, ok := quota.CclineCache(ac.Dir); ok {
+			cc = &s
 		}
-		if r.Last7d, r.Cost7d, err = svc.Usage(ctx, ac.Name, now.Add(-7*24*time.Hour)); err != nil {
-			return err
+		r.FiveHour, r.SevenDay = quota.Latest(status, cc)
+		// Usage is counted from the start of each window as the server
+		// defines it: the reset time minus the window's length.
+		for _, w := range []struct {
+			rd     *quota.Reading
+			length time.Duration
+			use    *render.WindowUse
+		}{{r.FiveHour, 5 * time.Hour, &r.Use5h}, {r.SevenDay, 7 * 24 * time.Hour, &r.Use7d}} {
+			since := now.Add(-w.length)
+			if rd := w.rd; rd != nil && !rd.ResetsAt.IsZero() {
+				since = rd.ResetsAt.Add(-w.length)
+				if rd.Expired(now) {
+					since = rd.ResetsAt // a new window started at the reset
+				}
+				w.use.Exact = true
+			}
+			w.use.Since = since
+			if w.use.Tokens, w.use.Cost, err = svc.Usage(ctx, ac.Name, since); err != nil {
+				return err
+			}
 		}
 		rows = append(rows, r)
 	}
